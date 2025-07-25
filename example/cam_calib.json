@@ -1,0 +1,18 @@
+{
+    "final_reproj_error": 0.8798450774346507,
+    "fps": 50.0,
+    "image_height": 540,
+    "image_width": 960,
+    "intrinsic_type": "DIVISION_UNDISTORTION",
+    "intrinsics": {
+      "aspect_ratio": 0.9805717422736094,
+      "div_undist_distortion": -1.201842919562806e-06,
+      "focal_length": 485.15956467957056,
+      "principal_pt_x": 478.4298050480452,
+      "principal_pt_y": 277.56282705516605,
+      "skew": 0.0
+    },
+    "nr_calib_images": 68,
+    "stabelized": false
+  }
+  

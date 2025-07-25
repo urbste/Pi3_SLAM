@@ -1,0 +1,13 @@
+
+torch==2.7.1
+numpy==1.26.4
+pillow
+opencv-python==4.9.0.80
+plyfile
+huggingface_hub
+safetensors
+tqdm
+scipy
+rerun-sdk
+pytheia
+torchcodec==0.4

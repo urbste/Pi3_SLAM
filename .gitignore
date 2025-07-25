@@ -1,0 +1,12 @@
+logs
+examples
+*.png
+
+*.pyc
+pycache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz

@@ -1,0 +1,18 @@
+{
+    "image_height": 480,
+    "image_width": 752,
+    "intrinsic_type": "PINHOLE_RADIAL_TANGENTIAL",
+    "intrinsics": {
+      "aspect_ratio": 0.9970391624187296,
+      "focal_length": 458.654,
+      "principal_pt_x": 367.215,
+      "principal_pt_y": 248.375,
+      "radial_distortion_1": -0.28340811,
+      "radial_distortion_2": 0.07395907,
+      "radial_distortion_3": 0.0,
+      "tangential_distortion_1": 0.00019359 ,
+      "tangential_distortion_2": 1.76187114e-05,
+      "skew": 0.0
+    }
+  }
+  
