@@ -37,7 +37,7 @@ class Pi3SLAMOnlineRerun:
                  device: str = 'cuda', conf_threshold: float = 0.5, 
                  undistortion_maps=None, cam_scale: float = 1.0,
                  max_chunks_in_memory: int = 5, enable_disk_cache: bool = False,
-                 cache_dir: str = None, rerun_port: int = 9090):
+                 cache_dir: str = None, rerun_port: int = 9090, enable_sim3_optimization: bool = True):
         """
         Initialize Pi3SLAM Online with Rerun visualization.
         """
@@ -51,7 +51,7 @@ class Pi3SLAMOnlineRerun:
         self.max_chunks_in_memory = max_chunks_in_memory
         self.enable_disk_cache = enable_disk_cache
         self.cache_dir = cache_dir
-        self.pixel_limit = 255000/2
+        self.pixel_limit = 255000
         self.memory_monitoring = True
         self.rerun_port = rerun_port
         
@@ -84,9 +84,15 @@ class Pi3SLAMOnlineRerun:
         }
         
         # Configuration for correspondence search
-        self.correspondence_subsample_factor = 4
+        self.correspondence_subsample_factor = 6
         self.use_robust_alignment = False
-        self.robust_alignment_method = 'auto'
+        
+        # Configuration for robust alignment
+        self.ransac_max_correspondence_distance = 0.01  # Maximum distance for valid correspondences
+        self.ransac_max_iterations = 500  # Maximum RANSAC iterations
+        self.icp_threshold = 0.05  # ICP distance threshold
+        self.icp_max_iterations = 10  # Maximum ICP iterations
+        self.enable_sim3_optimization = enable_sim3_optimization  # Enable/disable SIM3 optimization
         
         # Visualization
         self.vis_running = False
@@ -117,6 +123,8 @@ class Pi3SLAMOnlineRerun:
         if enable_disk_cache:
             print(f"   Disk cache: Enabled ({cache_dir or 'Temporary'})")
         print(f"   Max chunks in memory: {max_chunks_in_memory}")
+        print(f"   Robust alignment: RANSAC+ICP (distance: {self.ransac_max_correspondence_distance}, RANSAC iter: {self.ransac_max_iterations}, ICP iter: {self.icp_max_iterations})")
+        print(f"   SIM3 optimization: {'ENABLED' if self.enable_sim3_optimization else 'DISABLED'}")
     
     def _setup_disk_cache(self):
         """Set up disk cache if enabled."""
@@ -475,50 +483,108 @@ class Pi3SLAMOnlineRerun:
             correspondence_time = time.time() - correspondence_start
             
             if len(corresponding_points1) >= 10:
-                # Estimate SIM3 transformation from 3D points using robust method
+                # Estimate SIM3 transformation using robust Open3D RANSAC + ICP
                 sim3_start = time.time()
                 
-                # Choose robust estimation method based on configuration and number of points
-                if self.use_robust_alignment:
-                    if self.robust_alignment_method == 'ransac' or (self.robust_alignment_method == 'auto' and len(corresponding_points1) >= 50):
-                        # Use RANSAC for large point sets or when explicitly requested
-                        sim3_transform = estimate_sim3_transformation_robust(
-                            corresponding_points2, corresponding_points1,
-                            max_iterations=50,  # Reduced for speed
-                            inlier_threshold=0.05,  # 5cm threshold
-                            min_inlier_ratio=0.4
+                try:
+                    import open3d as o3d
+                    import open3d.pipelines.registration as treg
+                    
+                    # Create Open3D point clouds
+                    source_pcd = o3d.geometry.PointCloud()
+                    target_pcd = o3d.geometry.PointCloud()
+                    
+                    source_pcd.points = o3d.utility.Vector3dVector(corresponding_points2)  # Next chunk points
+                    target_pcd.points = o3d.utility.Vector3dVector(corresponding_points1)  # Current chunk points
+                    
+                    # Create correspondence set
+                    corres = o3d.utility.Vector2iVector()
+                    for i in range(len(corresponding_points1)):
+                        corres.append([i, i])
+                    
+                    # Set parameters for correspondence-based RANSAC
+                    max_correspondence_distance = self.ransac_max_correspondence_distance
+                    ransac_n = min(6, len(corresponding_points1))  # Number of correspondences for RANSAC (at least 3 for rigid, 6 for similarity)
+                    
+                    try:
+                        # Use correspondence-based RANSAC with explicit point correspondences
+                        ransac_result = treg.registration_ransac_based_on_correspondence(
+                            source_pcd, target_pcd, corres,
+                            max_correspondence_distance,
+                            treg.TransformationEstimationPointToPoint(with_scaling=True),
+                            ransac_n,
+                            criteria=treg.RANSACConvergenceCriteria(max_iteration=self.ransac_max_iterations)
                         )
-                        print(f"  🔧 Using RANSAC SIM3 estimation with {len(corresponding_points1)} points")
-                    elif self.robust_alignment_method == 'irls' or (self.robust_alignment_method == 'auto' and len(corresponding_points1) >= 20):
-                        # Use IRLS for medium point sets or when explicitly requested
-                        sim3_transform = estimate_sim3_transformation_robust_irls(
-                            corresponding_points2, corresponding_points1,
-                            max_iterations=15,
-                            convergence_threshold=1e-5
+                        print(f"RANSAC result: {ransac_result}")
+                        initial_transformation = ransac_result.transformation
+                        print(f"Correspondence-based RANSAC fitness: {ransac_result.fitness:.4f}")
+                        print(f"Correspondence-based RANSAC inlier RMSE: {ransac_result.inlier_rmse:.6f}")
+                        print(f"Initial transformation matrix:\n{initial_transformation}")
+                        
+                        # Refine with ICP using the initial transformation
+                        icp_result = treg.registration_icp(
+                            source_pcd, target_pcd,
+                            self.icp_threshold, initial_transformation,
+                            treg.TransformationEstimationPointToPoint(with_scaling=True),
+                            treg.ICPConvergenceCriteria(max_iteration=self.icp_max_iterations)
                         )
-                        print(f"  🔧 Using IRLS SIM3 estimation with {len(corresponding_points1)} points")
-                    else:
-                        # Use standard estimation for small point sets
+                        
+                        transformation_matrix = icp_result.transformation
+                        print(f"ICP refinement fitness: {icp_result.fitness:.4f}")
+                        print(f"ICP refinement RMSE: {icp_result.inlier_rmse:.6f}")
+                        print(f"Final transformation matrix:\n{transformation_matrix}")
+                        
+                        # Extract scale, rotation, and translation from final transformation
+                        R = transformation_matrix[:3, :3]
+                        t = transformation_matrix[:3, 3]
+                        
+                        # Extract scale from rotation matrix
+                        U, S, Vt = np.linalg.svd(R)
+                        scale = np.mean(S)
+                        
+                        # Normalize rotation matrix
+                        R_normalized = R / scale
+                        
+                        # Ensure proper rotation matrix
+                        U, _, Vt = np.linalg.svd(R_normalized)
+                        R_normalized = U @ Vt
+                        if np.linalg.det(R_normalized) < 0:
+                            Vt[-1, :] *= -1
+                            R_normalized = U @ Vt
+                        
+                        sim3_transform = SIM3Transformation(scale, R_normalized, t)
+                        print(f"  🔧 Robust RANSAC+ICP SIM3 estimation successful (RANSAC fitness: {ransac_result.fitness:.3f}, ICP fitness: {icp_result.fitness:.3f})")
+                        
+                    except Exception as ransac_error:
+                        print(f"  🔧 RANSAC+ICP failed: {ransac_error}, falling back to standard estimation")
                         sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
-                        print(f"  🔧 Using standard SIM3 estimation with {len(corresponding_points1)} points")
-                else:
-                    # Use standard estimation when robust alignment is disabled
+                        
+                except ImportError:
+                    # Fallback to standard estimation if Open3D not available
                     sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
-                    print(f"  🔧 Using standard SIM3 estimation with {len(corresponding_points1)} points")
+                    print(f"  🔧 Open3D not available, using standard SIM3 estimation with {len(corresponding_points1)} points")
+                except Exception as e:
+                    # Fallback to standard estimation on error
+                    sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
+                    print(f"  🔧 Open3D RANSAC+ICP failed: {e}, using standard SIM3 estimation")
                 
                 sim3_time = time.time() - sim3_start
                 
-                # Optimize SIM3 transformation using overlapping camera poses
-                optimize_start = time.time()
-                optimized_transform = self._optimize_sim3_transformation(
-                    sim3_transform, current_chunk, chunk_result, 
-                    current_camera_ids, chunk_camera_ids, common_camera_ids
-                )
-                optimize_time = time.time() - optimize_start
-
-                transformation = optimized_transform.get_matrix()
-                
-                print(f"  Optimized SIM3 transformation with scale={optimized_transform.s:.3f}")
+                # Optimize SIM3 transformation using overlapping camera poses with LM (optional)
+                if self.enable_sim3_optimization:
+                    optimize_start = time.time()
+                    optimized_transform = self._optimize_sim3_transformation(
+                        sim3_transform, current_chunk, chunk_result, 
+                        current_camera_ids, chunk_camera_ids, common_camera_ids
+                    )
+                    optimize_time = time.time() - optimize_start
+                    transformation = optimized_transform.get_matrix()
+                    print(f"  Optimized SIM3 transformation with scale={optimized_transform.s:.3f}")
+                else:
+                    # Skip optimization, use RANSAC+ICP result directly
+                    transformation = sim3_transform.get_matrix()
+                    optimize_time = 0.0
+                    print(f"  Using RANSAC+ICP transformation directly (optimization disabled)")
                 
                 # Apply transformation
                 transform_start = time.time()
@@ -706,10 +772,10 @@ class Pi3SLAMOnlineRerun:
                                     current_camera_ids: List[int], next_camera_ids: List[int],
                                     common_camera_ids: set) -> SIM3Transformation:
         """
-        Optimize SIM3 transformation by minimizing pose alignment error.
+        Optimize SIM3 transformation using LM least squares on overlapping camera poses.
         
         Args:
-            initial_transform: Initial SIM3 transformation from point correspondence
+            initial_transform: Initial SIM3 transformation from Open3D RANSAC
             current_chunk: Current chunk data
             next_chunk: Next chunk data
             current_camera_ids: Camera IDs in current chunk
@@ -803,8 +869,8 @@ class Pi3SLAMOnlineRerun:
             initial_translation
         ])
         
-        # Optimize using least squares
-        print(f"  Optimizing SIM3 transformation with {len(common_camera_ids)} overlapping cameras using least squares...")
+        # Optimize using LM least squares
+        print(f"  Optimizing SIM3 transformation with {len(common_camera_ids)} overlapping cameras using LM least squares...")
         
         try:
             result = least_squares(
@@ -828,7 +894,7 @@ class Pi3SLAMOnlineRerun:
             result = ResultWrapper(result)
             
         except Exception as e:
-            print(f"  Warning: Optimization failed: {e}, using initial transformation")
+            print(f"  Warning: LM optimization failed: {e}, using initial transformation")
             return initial_transform
         
         if result.success:
@@ -850,12 +916,12 @@ class Pi3SLAMOnlineRerun:
             pos_residuals = final_residuals[::6]  # Every 6th residual (position components)
             rot_residuals = final_residuals[3::6]  # Every 6th residual starting from 3rd (rotation components)
             
-            print(f"  Optimization successful. Final cost: {result.fun:.6f}")
+            print(f"  LM optimization successful. Final cost: {result.fun:.6f}")
             print(f"  Position RMS: {np.sqrt(np.mean(pos_residuals**2)):.6f}")
             print(f"  Rotation RMS: {np.sqrt(np.mean(rot_residuals**2)):.6f}")
             return optimized_transform
         else:
-            print(f"  Optimization failed: {result.message}, using initial transformation")
+            print(f"  LM optimization failed: {result.message}, using initial transformation")
             return initial_transform
     
     def _manage_memory(self):
@@ -1075,9 +1141,115 @@ class Pi3SLAMOnlineRerun:
             write_ply(torch.from_numpy(camera_positions), torch.from_numpy(camera_colors), camera_filename)
             print(f"📷 Saved {len(camera_positions)} camera poses to: {camera_filename}")
     
+    def save_trajectory_tum(self, save_path: str, timestamps: List[float] = None):
+        """
+        Save the final aligned trajectory in TUM format.
+        
+        Args:
+            save_path: Path to save the TUM format trajectory file
+            timestamps: Optional list of timestamps for each pose (if None, will use stored timestamps or frame indices)
+        """
+        if not self.full_camera_trajectory:
+            print("No camera trajectory available to save")
+            return
+        
+        try:
+            from scipy.spatial.transform import Rotation
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            # Use stored timestamps if available, otherwise use provided timestamps or frame indices
+            if timestamps is None:
+                if self.timestamps and len(self.timestamps) >= len(self.full_camera_trajectory):
+                    timestamps = self.timestamps[:len(self.full_camera_trajectory)]
+                else:
+                    timestamps = list(range(len(self.full_camera_trajectory)))
+            
+            print(f"💾 Saving trajectory in TUM format to: {save_path}")
+            print(f"   Using {len(timestamps)} timestamps for {len(self.full_camera_trajectory)} poses")
+            
+            with open(save_path, 'w') as f:
+                # TUM format header
+                f.write("# timestamp tx ty tz qx qy qz qw\n")
+                
+                for i, (camera_pos, camera_rot) in enumerate(zip(self.full_camera_trajectory, self.full_camera_orientations)):
+                    # Get timestamp (use stored timestamp if available, otherwise use frame index)
+                    t = timestamps[i] if i < len(timestamps) else float(i)
+                    
+                    # Extract translation (x, y, z)
+                    x, y, z = camera_pos
+                    
+                    # Convert rotation matrix to quaternion
+                    # Note: scipy uses quaternion format [x, y, z, w]
+                    quat = Rotation.from_matrix(camera_rot).as_quat()
+                    qx, qy, qz, qw = quat
+                    
+                    # Write TUM format line: timestamp tx ty tz qx qy qz qw
+                    # Use full precision for timestamp to match ground truth format
+                    f.write(f"{t:.9f} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
+            
+            print(f"✅ Saved trajectory with {len(self.full_camera_trajectory)} poses to: {save_path}")
+            
+        except ImportError:
+            print("❌ Error: scipy.spatial.transform.Rotation not available")
+        except Exception as e:
+            print(f"❌ Error saving trajectory: {e}")
+    
     def __del__(self):
         """Cleanup when object is destroyed."""
         try:
             self.stop_visualization()
         except:
-            pass 
+            pass
+    
+    def cleanup_disk_cache(self):
+        """Clean up disk cache files."""
+        if self.cache_dir and os.path.exists(self.cache_dir):
+            try:
+                import shutil
+                shutil.rmtree(self.cache_dir)
+                print(f"🧹 Cleaned up disk cache: {self.cache_dir}")
+            except Exception as e:
+                print(f"⚠️  Failed to clean up disk cache: {e}")
+    
+    def configure_alignment(self, ransac_max_correspondence_distance: float = 0.01, 
+                          ransac_max_iterations: int = 10, icp_threshold: float = 0.01, 
+                          icp_max_iterations: int = 50):
+        """
+        Configure alignment parameters for robust RANSAC+ICP alignment.
+        
+        Args:
+            ransac_max_correspondence_distance: Maximum distance for valid correspondences in RANSAC
+            ransac_max_iterations: Maximum RANSAC iterations
+            icp_threshold: ICP distance threshold for refinement
+            icp_max_iterations: Maximum ICP iterations for refinement
+        """
+        self.ransac_max_correspondence_distance = ransac_max_correspondence_distance
+        self.ransac_max_iterations = ransac_max_iterations
+        self.icp_threshold = icp_threshold
+        self.icp_max_iterations = icp_max_iterations
+        
+        print(f"🔧 Alignment configuration updated:")
+        print(f"   RANSAC max correspondence distance: {ransac_max_correspondence_distance}")
+        print(f"   RANSAC max iterations: {ransac_max_iterations}")
+        print(f"   ICP threshold: {icp_threshold}")
+        print(f"   ICP max iterations: {icp_max_iterations}")
+    
+    def get_statistics(self) -> Dict:
+        """Get processing statistics."""
+        total_processing_time = sum(self.stats['processing_times']) if self.stats['processing_times'] else 0
+        overall_fps = self.stats['total_frames'] / total_processing_time if total_processing_time > 0 else 0
+        
+        return {
+            'total_chunks': self.stats['total_chunks'],
+            'total_frames': self.stats['total_frames'],
+            'total_processing_time': total_processing_time,
+            'overall_fps': overall_fps,
+            'processing_times': self.stats['processing_times'],
+            'alignment_times': self.stats['alignment_times'],
+            'load_times': self.stats['load_times'],
+            'inference_times': self.stats['inference_times'],
+            'postprocess_times': self.stats['postprocess_times'],
+            'cpu_transfer_times': self.stats['cpu_transfer_times']
+        } 

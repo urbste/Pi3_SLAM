@@ -79,6 +79,10 @@ class UndistortionMaps:
             cam_undist.cam_intr_json["intrinsics"]["radial_distortion_3"] = 0.0
             cam_undist.cam_intr_json["intrinsics"]["tangential_distortion_1"] = 0.0
             cam_undist.cam_intr_json["intrinsics"]["tangential_distortion_2"] = 0.0
+
+        # set principal point to center of image
+        cam_undist.cam_intr_json["intrinsics"]["principal_point_x"] = self.cam_dist.cam_intr_json["image_width"] / 2
+        cam_undist.cam_intr_json["intrinsics"]["principal_point_y"] = self.cam_dist.cam_intr_json["image_height"] / 2
         
         # Set aspect ratio to 1 for square pixels
         cam_undist.cam_intr_json["intrinsics"]["aspect_ratio"] = 1.0

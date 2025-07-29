@@ -126,10 +126,17 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to run on (cuda/cpu)')
     
     # Processing options
-    parser.add_argument('--chunk_length', type=int, default=100, help='Number of frames per chunk')
+    parser.add_argument('--chunk_length', type=int, default=50, help='Number of frames per chunk')
     parser.add_argument('--overlap', type=int, default=10, help='Number of overlapping frames between chunks')
     parser.add_argument('--conf_threshold', type=float, default=0.5, help='Confidence threshold for filtering points')
     parser.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
+    
+    # Alignment options
+    parser.add_argument('--ransac_distance', type=float, default=0.01, help='RANSAC max correspondence distance')
+    parser.add_argument('--ransac_iterations', type=int, default=100, help='RANSAC max iterations')
+    parser.add_argument('--icp_threshold', type=float, default=0.01, help='ICP distance threshold')
+    parser.add_argument('--icp_iterations', type=int, default=100, help='ICP max iterations')
+    parser.add_argument('--no_sim3_optimization', action='store_true', help='Disable SIM3 optimization after RANSAC+ICP')
     
     # Undistortion options
     parser.add_argument('--cam_dist_path', type=str, help='Path to camera calibration file for undistortion')
@@ -146,6 +153,7 @@ def main():
     # Output options
     parser.add_argument('--output_path', type=str, default='output/trajectory.ply', help='Output path for trajectory')
     parser.add_argument('--max_points', type=int, default=1000000, help='Maximum points to save')
+    parser.add_argument('--save_tum', action='store_true', help='Save trajectory in TUM format for evaluation')
     
     args = parser.parse_args()
     
@@ -219,7 +227,17 @@ def main():
         max_chunks_in_memory=args.max_chunks_in_memory,
         enable_disk_cache=args.enable_disk_cache,
         cache_dir=args.cache_dir,
-        rerun_port=args.rerun_port
+        rerun_port=args.rerun_port,
+        enable_sim3_optimization=not args.no_sim3_optimization
+    )
+    
+    # Configure robust alignment parameters
+    print("🔧 Configuring robust alignment parameters...")
+    slam.configure_alignment(
+        ransac_max_correspondence_distance=args.ransac_distance,
+        ransac_max_iterations=args.ransac_iterations,
+        icp_threshold=args.icp_threshold,
+        icp_max_iterations=args.icp_iterations
     )
     
     # Start background loader
@@ -246,10 +264,36 @@ def main():
         print(f"Total processing time: {stats.get('total_processing_time', 0):.2f}s")
         print(f"Overall FPS: {stats.get('overall_fps', 0):.1f}")
         
+        # Print alignment configuration
+        print(f"\n🔧 Alignment Configuration:")
+        print(f"   RANSAC distance threshold: {args.ransac_distance}")
+        print(f"   RANSAC max iterations: {args.ransac_iterations}")
+        print(f"   ICP distance threshold: {args.icp_threshold}")
+        print(f"   ICP max iterations: {args.icp_iterations}")
+        
         # Save results
         print(f"\n💾 Saving results to: {args.output_path}")
-        os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-        slam.save_final_result(args.output_path, max_points=args.max_points)
+        
+        # Handle output path - if it's a directory, create trajectory.ply inside it
+        if os.path.isdir(args.output_path) or args.output_path.endswith('/'):
+            # It's a directory, create trajectory.ply inside it
+            output_dir = args.output_path
+            ply_path = os.path.join(output_dir, 'trajectory.ply')
+            tum_path = os.path.join(output_dir, 'trajectory.tum')
+        else:
+            # It's a file path
+            ply_path = args.output_path
+            tum_path = args.output_path.replace('.ply', '.tum')
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+        
+        slam.save_final_result(ply_path, max_points=args.max_points)
+        
+        # Save TUM format trajectory if requested
+        if args.save_tum:
+            print(f"\n📊 Saving TUM format trajectory...")
+            slam.save_trajectory_tum(tum_path)
         
         print("✅ Processing completed successfully!")
         

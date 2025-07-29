@@ -37,14 +37,16 @@ for dataset in ${datasets[@]}; do
     
     # Run SLAM with calibration
     echo "🔧 Running SLAM with camera calibration..."
-    python pi3_slam_online_rerun.py \
-        --dataset_path "$dataset_name" \
-        --calib_file "$calib_file" \
-        --output_dir "$output_dir/calib/$dataset" \
+    python pi3_slam_online_rerun_modular.py \
+        --image_dir "$dataset_name"/mav0/cam0/data \
+        --cam_dist_path "$calib_file" \
+        --output_path "$output_dir/calib/$dataset" \
         --save_tum \
-        --overlap 10 \
-        --chunk_length 30 \
+        --overlap 20 \
+        --chunk_length 100 \
         --conf_threshold 0.5 \
+        --skip_start 1000 \
+        --no_visualization
  
     
     echo "✅ Completed processing for $dataset"

@@ -108,6 +108,40 @@ def load_images_from_paths(image_paths: List, target_size: Tuple[int, int],
     return images_tensor
 
 
+def load_single_image(image_path: str, target_size: Tuple[int, int], device: str = 'cpu') -> torch.Tensor:
+    """
+    Load and preprocess a single image.
+    
+    Args:
+        image_path: Path to the image file
+        target_size: Target size (width, height)
+        device: Device to load tensor on
+    
+    Returns:
+        Preprocessed image tensor (C, H, W)
+    """
+    try:
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        
+        # Resize image
+        image = image.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # Convert to tensor
+        image_tensor = torch.from_numpy(np.array(image)).float()
+        image_tensor = image_tensor.permute(2, 0, 1)  # HWC -> CHW
+        image_tensor = image_tensor / 255.0  # Normalize to [0, 1]
+        
+        # Move to device
+        image_tensor = image_tensor.to(device)
+        
+        return image_tensor
+        
+    except Exception as e:
+        print(f"Error loading image {image_path}: {e}")
+        raise
+
+
 def extract_colors_from_chunk(chunk_result: dict) -> torch.Tensor:
     """Extract colors from chunk result."""
     print(chunk_result['images'].shape)

@@ -11,3 +11,5 @@ scipy
 rerun-sdk
 pytheia
 torchcodec==0.4
+open3d==0.19.0
+kornia

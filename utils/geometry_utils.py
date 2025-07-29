@@ -7,6 +7,48 @@ import torch
 from typing import Tuple
 
 
+class SIM3Transformation:
+    """SIM3 transformation class (scale, rotation, translation)."""
+    
+    def __init__(self, s: float = 1.0, R: np.ndarray = None, t: np.ndarray = None):
+        """
+        Initialize SIM3 transformation.
+        
+        Args:
+            s: Scale factor
+            R: Rotation matrix (3, 3)
+            t: Translation vector (3,)
+        """
+        self.s = s
+        self.R = R if R is not None else np.eye(3)
+        self.t = t if t is not None else np.zeros(3)
+    
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        """Transform 3D points using SIM3 transformation."""
+        return self.s * (points @ self.R.T) + self.t
+    
+    def compose(self, other: 'SIM3Transformation') -> 'SIM3Transformation':
+        """Compose this transformation with another."""
+        new_s = self.s * other.s
+        new_R = self.R @ other.R
+        new_t = self.s * (self.R @ other.t) + self.t
+        return SIM3Transformation(new_s, new_R, new_t)
+    
+    def inverse(self) -> 'SIM3Transformation':
+        """Compute inverse transformation."""
+        inv_s = 1.0 / self.s
+        inv_R = self.R.T
+        inv_t = -inv_s * (inv_R @ self.t)
+        return SIM3Transformation(inv_s, inv_R, inv_t)
+    
+    def get_matrix(self) -> np.ndarray:
+        """Get 4x4 homogeneous transformation matrix."""
+        matrix = np.eye(4)
+        matrix[:3, :3] = self.s * self.R
+        matrix[:3, 3] = self.t
+        return matrix
+
+
 def rodrigues_to_rotation_matrix(rodrigues: np.ndarray) -> np.ndarray:
     """
     Convert Rodrigues parameters to rotation matrix.
@@ -74,6 +116,27 @@ def homogenize_points(points: torch.Tensor) -> torch.Tensor:
     return torch.cat([points, ones], dim=-1)
 
 
+def apply_transformation_to_points(points: torch.Tensor, transformation: np.ndarray) -> torch.Tensor:
+    """Apply similarity transformation (SIM3) to 3D points."""
+    points_homog = homogenize_points(points)
+    transformation_tensor = torch.from_numpy(transformation).to(torch.float32)
+    transformed_points_homog = (transformation_tensor @ points_homog.view(-1, 4).T).T
+    transformed_points_homog = transformed_points_homog.view(points.shape[0], points.shape[1], points.shape[2], 4)
+    return transformed_points_homog[:,:,:,:3]
+
+
+def apply_transformation_to_poses(poses: torch.Tensor, transformation: np.ndarray) -> torch.Tensor:
+    """Apply similarity transformation (SIM3) to camera poses."""
+    transformed_poses = []
+    transformation_tensor = torch.from_numpy(transformation).to(torch.float32)
+    
+    for pose in poses:
+        transformed_pose = transformation_tensor @ pose
+        transformed_poses.append(transformed_pose)
+    
+    return torch.stack(transformed_poses)
+
+
 def compute_rigid_transformation(source_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
     """
     Compute optimal rigid transformation using Procrustes analysis.
@@ -111,27 +174,6 @@ def compute_rigid_transformation(source_points: np.ndarray, target_points: np.nd
     transformation[:3, 3] = t
     
     return transformation
-
-
-def apply_transformation_to_points(points: torch.Tensor, transformation: np.ndarray) -> torch.Tensor:
-    """Apply similarity transformation (SIM3) to 3D points."""
-    points_homog = homogenize_points(points)
-    transformation_tensor = torch.from_numpy(transformation).to(torch.float32)
-    transformed_points_homog = (transformation_tensor @ points_homog.view(-1, 4).T).T
-    transformed_points_homog = transformed_points_homog.view(points.shape[0], points.shape[1], points.shape[2], 4)
-    return transformed_points_homog[:,:,:,:3]
-
-
-def apply_transformation_to_poses(poses: torch.Tensor, transformation: np.ndarray) -> torch.Tensor:
-    """Apply similarity transformation (SIM3) to camera poses."""
-    transformed_poses = []
-    transformation_tensor = torch.from_numpy(transformation).to(torch.float32)
-    
-    for pose in poses:
-        transformed_pose = transformation_tensor @ pose
-        transformed_poses.append(transformed_pose)
-    
-    return torch.stack(transformed_poses)
 
 
 def verify_coordinate_system(points: torch.Tensor, camera_poses: torch.Tensor) -> bool:

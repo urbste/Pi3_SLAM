@@ -16,5 +16,5 @@ Works for my forward facing GoPro odometry videos but not as robust for general 
  - [] Localize a second camera to the reconstructed one
  - [] scale using GPS priors
  - [] align to Gravity with Imu priors
- - 
+ 
 
