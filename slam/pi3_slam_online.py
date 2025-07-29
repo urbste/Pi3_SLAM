@@ -84,7 +84,7 @@ class Pi3SLAMOnlineRerun:
         }
         
         # Configuration for correspondence search
-        self.correspondence_subsample_factor = 6
+        self.correspondence_subsample_factor = 10
         self.use_robust_alignment = False
         
         # Configuration for robust alignment
@@ -525,7 +525,7 @@ class Pi3SLAMOnlineRerun:
                         icp_result = treg.registration_icp(
                             source_pcd, target_pcd,
                             self.icp_threshold, initial_transformation,
-                            treg.TransformationEstimationPointToPoint(with_scaling=True),
+                            treg.TransformationEstimationPointToPoint(with_scaling=False),
                             treg.ICPConvergenceCriteria(max_iteration=self.icp_max_iterations)
                         )
                         
@@ -787,6 +787,7 @@ class Pi3SLAMOnlineRerun:
         """
         try:
             from scipy.optimize import least_squares
+            from utils.geometry_utils import rodrigues_to_rotation_matrix, rotation_matrix_to_rodrigues
         except ImportError:
             print("  Warning: scipy not available, using initial transformation")
             return initial_transform
@@ -795,133 +796,83 @@ class Pi3SLAMOnlineRerun:
         current_poses = []
         next_poses = []
         
-        for camera_id in sorted(common_camera_ids):
-            # Find camera index in current chunk
+        for camera_id in sorted(list(common_camera_ids)):
             current_idx = current_camera_ids.index(camera_id)
             current_poses.append(current_chunk['camera_poses'][current_idx].numpy())
             
-            # Find camera index in next chunk
             next_idx = next_camera_ids.index(camera_id)
             next_poses.append(next_chunk['camera_poses'][next_idx].numpy())
         
-        current_poses = np.stack(current_poses)  # (N, 4, 4)
-        next_poses = np.stack(next_poses)        # (N, 4, 4)
+        if not current_poses:
+            return initial_transform
+
+        current_poses = np.stack(current_poses)
+        next_poses = np.stack(next_poses)
         
-        # Extract camera positions (translation part)
-        current_positions = current_poses[:, :3, 3]  # (N, 3)
-        next_positions = next_poses[:, :3, 3]        # (N, 3)
-        
-        # Extract camera orientations (rotation part)
-        current_rotations = current_poses[:, :3, :3]  # (N, 3, 3)
-        next_rotations = next_poses[:, :3, :3]        # (N, 3, 3)
+        current_positions = current_poses[:, :3, 3]
+        current_rotations = current_poses[:, :3, :3]
         
         def residual_function(params):
             """Residual function for least squares optimization."""
-            # Unpack parameters: [scale, rx, ry, rz, tx, ty, tz]
             scale = params[0]
             rodrigues = params[1:4]
             translation = params[4:7]
             
-            # Convert Rodrigues parameters to rotation matrix
-            from utils.geometry_utils import rodrigues_to_rotation_matrix
             R = rodrigues_to_rotation_matrix(rodrigues)
             
-            # Create transformation matrix
             T = np.eye(4)
             T[:3, :3] = scale * R
             T[:3, 3] = translation
             
             residuals = []
             
-            # Weighting factors for balancing position and rotation
             pos_weight = 1.0
-            rot_weight = 0.1  # Rotation residuals are typically smaller in magnitude
+            rot_weight = 0.1
             
-            # Apply transformation to next chunk poses
-            for i, pose in enumerate(next_poses):
-                transformed_pose = T @ pose
-                
-                # Position residuals (3 components per camera) - weighted
-                pos_residual = pos_weight * (current_positions[i] - transformed_pose[:3, 3])
-                residuals.extend(pos_residual)
-                
-                # Rotation residuals using Rodrigues representation - weighted
-                from utils.geometry_utils import rotation_matrix_to_rodrigues
-                relative_rot = current_rotations[i] @ transformed_pose[:3, :3].T
-                relative_rodrigues = rotation_matrix_to_rodrigues(relative_rot)
-                rot_residual = rot_weight * relative_rodrigues
-                residuals.extend(rot_residual)
+            transformed_poses = T @ next_poses
             
-            return np.array(residuals)
+            pos_residuals = pos_weight * (current_positions - transformed_poses[:, :3, 3])
+            residuals.append(pos_residuals.flatten())
+            
+            relative_rots = current_rotations @ transformed_poses[:, :3, :3].transpose(0, 2, 1)
+            
+            # This part can be slow in a loop. Vectorizing if possible.
+            rot_residuals = rot_weight * np.array([rotation_matrix_to_rodrigues(m) for m in relative_rots])
+            residuals.append(rot_residuals.flatten())
+            
+            return np.concatenate(residuals)
         
-        # Initial parameters from the initial transformation
-        initial_scale = initial_transform.s
-        initial_rotation = initial_transform.R
-        initial_translation = initial_transform.t
-        
-        # Convert rotation matrix to Rodrigues parameters
-        from utils.geometry_utils import rotation_matrix_to_rodrigues
-        initial_rodrigues = rotation_matrix_to_rodrigues(initial_rotation)
+        initial_rodrigues = rotation_matrix_to_rodrigues(initial_transform.R)
         
         initial_params = np.concatenate([
-            [initial_scale],
+            [initial_transform.s],
             initial_rodrigues,
-            initial_translation
+            initial_transform.t
         ])
         
-        # Optimize using LM least squares
-        print(f"  Optimizing SIM3 transformation with {len(common_camera_ids)} overlapping cameras using LM least squares...")
-        
         try:
-            result = least_squares(
+            res = least_squares(
                 residual_function,
                 initial_params,
                 method='lm',
-                max_nfev=100,  # Maximum function evaluations
-                ftol=1e-6,     # Function tolerance
-                xtol=1e-6,     # Parameter tolerance
-                verbose=0
+                verbose=0,
+                ftol=1e-4,
+                xtol=1e-4,
+                gtol=1e-4
             )
             
-            # Convert least_squares result to minimize-like format
-            class ResultWrapper:
-                def __init__(self, ls_result):
-                    self.success = ls_result.success
-                    self.x = ls_result.x
-                    self.fun = np.sum(ls_result.fun ** 2)  # Sum of squared residuals
-                    self.message = ls_result.message
-            
-            result = ResultWrapper(result)
-            
+            if res.success:
+                optimized_scale = res.x[0]
+                optimized_rodrigues = res.x[1:4]
+                optimized_translation = res.x[4:7]
+                optimized_rotation = rodrigues_to_rotation_matrix(optimized_rodrigues)
+                
+                return SIM3Transformation(optimized_scale, optimized_rotation, optimized_translation)
+            else:
+                print(f"  LM optimization failed: {res.message}, using initial transformation")
+                return initial_transform
         except Exception as e:
             print(f"  Warning: LM optimization failed: {e}, using initial transformation")
-            return initial_transform
-        
-        if result.success:
-            # Extract optimized parameters
-            optimized_scale = result.x[0]
-            optimized_rodrigues = result.x[1:4]
-            optimized_translation = result.x[4:7]
-            
-            # Convert back to rotation matrix
-            from utils.geometry_utils import rodrigues_to_rotation_matrix
-            optimized_rotation = rodrigues_to_rotation_matrix(optimized_rodrigues)
-            
-            optimized_transform = SIM3Transformation(
-                optimized_scale, optimized_rotation, optimized_translation
-            )
-            
-            # Calculate final residuals for diagnostics
-            final_residuals = residual_function(result.x)
-            pos_residuals = final_residuals[::6]  # Every 6th residual (position components)
-            rot_residuals = final_residuals[3::6]  # Every 6th residual starting from 3rd (rotation components)
-            
-            print(f"  LM optimization successful. Final cost: {result.fun:.6f}")
-            print(f"  Position RMS: {np.sqrt(np.mean(pos_residuals**2)):.6f}")
-            print(f"  Rotation RMS: {np.sqrt(np.mean(rot_residuals**2)):.6f}")
-            return optimized_transform
-        else:
-            print(f"  LM optimization failed: {result.message}, using initial transformation")
             return initial_transform
     
     def _manage_memory(self):
@@ -1141,13 +1092,14 @@ class Pi3SLAMOnlineRerun:
             write_ply(torch.from_numpy(camera_positions), torch.from_numpy(camera_colors), camera_filename)
             print(f"📷 Saved {len(camera_positions)} camera poses to: {camera_filename}")
     
-    def save_trajectory_tum(self, save_path: str, timestamps: List[float] = None):
+    def save_trajectory_tum(self, save_path: str, timestamps: List[float] = None, integer_timestamp: bool = False):
         """
         Save the final aligned trajectory in TUM format.
         
         Args:
             save_path: Path to save the TUM format trajectory file
             timestamps: Optional list of timestamps for each pose (if None, will use stored timestamps or frame indices)
+            integer_timestamp: If True, saves timestamps as integers (for 7-scenes). Otherwise, saves as float (for EuRoC).
         """
         if not self.full_camera_trajectory:
             print("No camera trajectory available to save")
@@ -1159,35 +1111,42 @@ class Pi3SLAMOnlineRerun:
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
-            # Use stored timestamps if available, otherwise use provided timestamps or frame indices
-            if timestamps is None:
-                if self.timestamps and len(self.timestamps) >= len(self.full_camera_trajectory):
-                    timestamps = self.timestamps[:len(self.full_camera_trajectory)]
-                else:
-                    timestamps = list(range(len(self.full_camera_trajectory)))
+            # Override timestamps with a simple range if integer_timestamp is requested
+            if integer_timestamp:
+                timestamps_to_use = list(range(len(self.full_camera_trajectory)))
+                print("   Using integer frame indices as timestamps.")
+            elif timestamps is not None:
+                timestamps_to_use = timestamps
+            elif self.timestamps and len(self.timestamps) >= len(self.full_camera_trajectory):
+                timestamps_to_use = self.timestamps[:len(self.full_camera_trajectory)]
+            else:
+                timestamps_to_use = list(range(len(self.full_camera_trajectory)))
+
             
             print(f"💾 Saving trajectory in TUM format to: {save_path}")
-            print(f"   Using {len(timestamps)} timestamps for {len(self.full_camera_trajectory)} poses")
+            print(f"   Using {len(timestamps_to_use)} timestamps for {len(self.full_camera_trajectory)} poses")
             
             with open(save_path, 'w') as f:
                 # TUM format header
                 f.write("# timestamp tx ty tz qx qy qz qw\n")
                 
                 for i, (camera_pos, camera_rot) in enumerate(zip(self.full_camera_trajectory, self.full_camera_orientations)):
-                    # Get timestamp (use stored timestamp if available, otherwise use frame index)
-                    t = timestamps[i] if i < len(timestamps) else float(i)
+                    # Get timestamp
+                    t = timestamps_to_use[i] if i < len(timestamps_to_use) else i
                     
                     # Extract translation (x, y, z)
                     x, y, z = camera_pos
                     
                     # Convert rotation matrix to quaternion
-                    # Note: scipy uses quaternion format [x, y, z, w]
                     quat = Rotation.from_matrix(camera_rot).as_quat()
                     qx, qy, qz, qw = quat
                     
                     # Write TUM format line: timestamp tx ty tz qx qy qz qw
-                    # Use full precision for timestamp to match ground truth format
-                    f.write(f"{t:.9f} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
+                    if integer_timestamp:
+                        f.write(f"{int(t)} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
+                    else:
+                        # Use full precision for timestamp to match ground truth format
+                        f.write(f"{t:.9f} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
             
             print(f"✅ Saved trajectory with {len(self.full_camera_trajectory)} poses to: {save_path}")
             

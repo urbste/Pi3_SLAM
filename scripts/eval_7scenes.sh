@@ -59,8 +59,9 @@ for dataset in ${datasets[@]}; do
         --ransac_distance 0.01 \
         --ransac_iterations 100 \
         --icp_threshold 0.01 \
-        --icp_iterations 100 \
-        --rerun_port 9090"
+        --icp_iterations 5 \
+        --rerun_port 9090 \
+        --tum_integer_timestamp"
     
     # Add SIM3 optimization flag if enabled
     if [ "$enable_sim3_optimization" = "true" ]; then

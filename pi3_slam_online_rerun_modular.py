@@ -154,6 +154,7 @@ def main():
     parser.add_argument('--output_path', type=str, default='output/trajectory.ply', help='Output path for trajectory')
     parser.add_argument('--max_points', type=int, default=1000000, help='Maximum points to save')
     parser.add_argument('--save_tum', action='store_true', help='Save trajectory in TUM format for evaluation')
+    parser.add_argument('--tum_integer_timestamp', action='store_true', help='Use integer timestamps in TUM output (for 7-scenes)')
     
     args = parser.parse_args()
     
@@ -293,7 +294,7 @@ def main():
         # Save TUM format trajectory if requested
         if args.save_tum:
             print(f"\n📊 Saving TUM format trajectory...")
-            slam.save_trajectory_tum(tum_path)
+            slam.save_trajectory_tum(tum_path, integer_timestamp=args.tum_integer_timestamp)
         
         print("✅ Processing completed successfully!")
         

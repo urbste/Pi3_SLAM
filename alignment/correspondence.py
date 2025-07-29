@@ -6,12 +6,13 @@ import torch
 import numpy as np
 from typing import List, Tuple
 from alignment.sim3_transformation import detect_outliers_using_mahalanobis, estimate_sim3_transformation
+import open3d as o3d
 
 
 def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor, 
                             camera_ids1: List[int], camera_ids2: List[int],
                             conf1: torch.Tensor = None, conf2: torch.Tensor = None,
-                            subsample_factor: int = 4,  # Increased default subsampling for speed
+                            subsample_factor: int = 4,
                             conf_threshold: float = 0.5, 
                             threshold: float = 0.1,
                             use_robust_filtering: bool = True) -> Tuple[np.ndarray, np.ndarray]:
