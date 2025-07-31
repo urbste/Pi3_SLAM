@@ -11,5 +11,7 @@ __pycache__
 *.pyw
 *.pyz
 
-
+*.ply
+*.log
+*.gif
 output/

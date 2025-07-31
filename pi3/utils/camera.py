@@ -50,6 +50,20 @@ class Camera:
             self.cam_intr_json = json.load(f)
         self._load_camera_calibration(scale)
 
+    def create_from_intrinsics(self, intrinsics, width, height, scale=1.0):
+        ''' Create a camera object from intrinsics.
+        '''
+        self.intr = pt.sfm.Camera()
+        self.prior = pt.sfm.CameraIntrinsicsPrior()
+        fx, fy, cx, cy = intrinsics[0,0], intrinsics[1,1], intrinsics[0,2], intrinsics[1,2]
+        self.prior.aspect_ratio.value = [fy/fx]
+        self.prior.image_width = int(width * scale)
+        self.prior.image_height = int(height * scale)
+        self.prior.principal_point.value = [cx * scale, cy * scale]
+        self.prior.focal_length.value = [fx * scale]
+        self.prior.skew.value = [0.0]
+        self.intr.SetFromCameraIntrinsicsPriors(self.prior)
+
     def _load_camera_calibration(self, scale=1.0):
         ''' Internal method to load camera calibration data and set intrinsic parameters.
 

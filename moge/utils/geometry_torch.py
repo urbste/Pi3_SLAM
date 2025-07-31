@@ -7,9 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.types
-#import utils3d
+import utils3d
 
-from utils.geometry_numpy import solve_optimal_focal_shift, solve_optimal_shift
+from .tools import timeit
+from .geometry_numpy import solve_optimal_focal_shift, solve_optimal_shift
 
 
 def weighted_mean(x: torch.Tensor, w: torch.Tensor = None, dim: Union[int, torch.Size] = None, keepdim: bool = False, eps: float = 1e-7) -> torch.Tensor:
@@ -167,16 +168,6 @@ def recover_focal_shift(points: torch.Tensor, mask: torch.Tensor = None, focal: 
         optim_focal = focal.reshape(shape[:-3])
 
     return optim_focal, optim_shift
-
-def project_xyz_to_uv(xyz: torch.Tensor, shift: torch.Tensor, intrinsics: torch.Tensor):
-    "Project 3D points to 2D image plane"
-    from pi3.utils.geometry import homogenize_points
-    xy, z = xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    xy_proj = xy / (z[..., None] + shift[..., None])
-    uv = homogenize_points(xy_proj) @ intrinsics.T
-    uv = uv[:,:2].reshape(xyz.shape[:-1]+(2,))
-    return uv, torch.cat([xy, z[..., None]], dim=-1)
 
 
 def mask_aware_nearest_resize(
