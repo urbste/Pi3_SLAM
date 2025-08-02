@@ -349,7 +349,6 @@ def recover_intrinsics_from_points(result: dict, images_tensor: torch.Tensor) ->
 
     keypoints = aliked_extractor({"image": images_tensor[0,:].to(points.device)})["keypoints"]
 
-
     # Add cameras to reconstruction
     vid_recs = []
     for vid in range(images_tensor.shape[1]):
@@ -368,7 +367,6 @@ def recover_intrinsics_from_points(result: dict, images_tensor: torch.Tensor) ->
         vid_recs.append(vid_rec)
 
     pt.sfm.SetCameraIntrinsicsFromPriors(recon)
-
 
     for vid in range(images_tensor.shape[1]):
         with torch.no_grad():
@@ -407,21 +405,22 @@ def recover_intrinsics_from_points(result: dict, images_tensor: torch.Tensor) ->
 
     # Add points to reconstruction
 
-    opts = pt.sfm.BundleAdjustmentOptions()
-    opts.robust_loss_width = 1.345
-    opts.verbose = True
-    opts.loss_function_type = pt.sfm.LossFunctionType.HUBER
-    opts.use_position_priors = False
-    # opts.use_gravity_priors = True
-    opts.use_homogeneous_point_parametrization = True
-    opts.use_inverse_depth_parametrization = False
-    estimated_views = sorted(pt.sfm.GetEstimatedViewsFromReconstruction(recon))
-    const_views = [estimated_views[0]]
-    var_views = [vid for vid in estimated_views if vid not in const_views]
-    #fix the first and last view
-    #otherwise the reconstruction might drift away after setting it to the origin
-    ba_sum = pt.sfm.BundleAdjustPartialViewsConstant(opts, var_views, const_views, recon)
+    # opts = pt.sfm.BundleAdjustmentOptions()
+    # opts.robust_loss_width = 1.345
+    # opts.verbose = True
+    # opts.loss_function_type = pt.sfm.LossFunctionType.HUBER
+    # opts.use_position_priors = False
+    # # opts.use_gravity_priors = True
+    # opts.use_homogeneous_point_parametrization = True
+    # opts.use_inverse_depth_parametrization = False
+    # estimated_views = sorted(pt.sfm.GetEstimatedViewsFromReconstruction(recon))
+    # const_views = [estimated_views[0]]
+    # var_views = [vid for vid in estimated_views if vid not in const_views]
+    # #fix the first and last view
+    # #otherwise the reconstruction might drift away after setting it to the origin
+    # ba_sum = pt.sfm.BundleAdjustPartialViewsConstant(opts, var_views, const_views, recon)
     pt.io.WritePlyFile("reconstruction_pcl.ply", recon, np.random.randint(0,255, (3)).tolist(),1)
+    pt.io.WriteReconstruction("reconstruction.sfm", recon)
 
     return {
         'focal': focal,

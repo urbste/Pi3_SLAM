@@ -18,10 +18,6 @@ from pi3.utils.geometry import depth_edge
 from utils.geometry_utils import apply_transformation_to_points, apply_transformation_to_poses, verify_coordinate_system
 from utils.image_utils import calculate_target_size, load_images_from_paths, extract_colors_from_chunk
 from utils.timestamp_utils import extract_timestamps_from_paths
-from alignment.sim3_transformation import (
-    SIM3Transformation, estimate_sim3_transformation, estimate_sim3_transformation_robust,
-    estimate_sim3_transformation_robust_irls
-)
 from alignment.correspondence import find_corresponding_points
 from datasets.image_datasets import ChunkImageDataset
 from visualization.rerun_visualizer import visualization_process
@@ -92,7 +88,6 @@ class Pi3SLAMOnlineRerun:
         self.ransac_max_iterations = 500  # Maximum RANSAC iterations
         self.icp_threshold = 0.05  # ICP distance threshold
         self.icp_max_iterations = 10  # Maximum ICP iterations
-        self.enable_sim3_optimization = enable_sim3_optimization  # Enable/disable SIM3 optimization
         
         # Visualization
         self.vis_running = False
@@ -124,7 +119,6 @@ class Pi3SLAMOnlineRerun:
             print(f"   Disk cache: Enabled ({cache_dir or 'Temporary'})")
         print(f"   Max chunks in memory: {max_chunks_in_memory}")
         print(f"   Robust alignment: RANSAC+ICP (distance: {self.ransac_max_correspondence_distance}, RANSAC iter: {self.ransac_max_iterations}, ICP iter: {self.icp_max_iterations})")
-        print(f"   SIM3 optimization: {'ENABLED' if self.enable_sim3_optimization else 'DISABLED'}")
     
     def _setup_disk_cache(self):
         """Set up disk cache if enabled."""
@@ -146,7 +140,7 @@ class Pi3SLAMOnlineRerun:
             # Calculate target size from first image if not already set
             if self.target_size is None:
                 self.target_size = calculate_target_size(all_image_paths[0], self.pixel_limit)
-            
+            print(f"target_size: {self.target_size}")
             # Create chunk-based dataset
             dataset = ChunkImageDataset(all_image_paths, self.chunk_length, self.overlap, 
                                       self.target_size, device='cpu', 
@@ -350,11 +344,10 @@ class Pi3SLAMOnlineRerun:
             timing = aligned_chunk.get('timing', {})
             correspondence_time = timing.get('correspondence', 0.0)
             sim3_time = timing.get('sim3', 0.0)
-            optimize_time = timing.get('optimize', 0.0)
             transform_time = timing.get('transform', 0.0)
             color_time = timing.get('color', 0.0)
             
-            print(f"   Alignment: {alignment_time:.2f}s (Corresp: {correspondence_time:.2f}s, SIM3: {sim3_time:.2f}s, Optimize: {optimize_time:.2f}s, Transform: {transform_time:.2f}s)")
+            print(f"   Alignment: {alignment_time:.2f}s (Corresp: {correspondence_time:.2f}s, SIM3: {sim3_time:.2f}s, Transform: {transform_time:.2f}s)")
             print(f"   Colors: {color_time:.2f}s")
         else:
             print(f"   Alignment: {alignment_time:.2f}s (first chunk)")
@@ -369,6 +362,27 @@ class Pi3SLAMOnlineRerun:
             'camera_ids': chunk_camera_ids,
             'timestamps': chunk_timestamps
         }
+    
+    def _optimize_sim3_pytheia(self, source_points: np.ndarray, target_points: np.ndarray, confidences: np.ndarray) -> np.ndarray:
+
+        import pytheia as pt
+        options = pt.sfm.Sim3AlignmentOptions()
+        
+        # Test default values
+        options.alignment_type == pt.sfm.Sim3AlignmentType.ROBUST_POINT_TO_POINT
+        options.max_iterations == 20
+        options.huber_threshold == 1.0
+        options.verbose == False
+        
+        point_weights = confidences
+        options.set_point_weights(point_weights)
+
+        summary = pt.sfm.OptimizeAlignmentSim3(source_points, target_points, options)
+                
+        # Check that estimated parameters are close to ground truth
+        T_source_to_target = pt.math.Sim3d.exp(summary.sim3_params).matrix()
+        
+        return T_source_to_target
     
     def _align_chunk_online(self, chunk_result: Dict, chunk_camera_ids: List[int]) -> Dict:
         """Align a new chunk with previously processed chunks."""
@@ -471,7 +485,7 @@ class Pi3SLAMOnlineRerun:
         if len(common_camera_ids) >= 2:
             # Find corresponding points
             correspondence_start = time.time()
-            corresponding_points1, corresponding_points2 = find_corresponding_points(
+            corresponding_points1, corresponding_points2, mean_conf = find_corresponding_points(
                 current_chunk['points'], chunk_result['points'],
                 current_camera_ids, chunk_camera_ids,
                 conf1=current_chunk.get('conf', None),
@@ -485,111 +499,16 @@ class Pi3SLAMOnlineRerun:
             if len(corresponding_points1) >= 10:
                 # Estimate SIM3 transformation using robust Open3D RANSAC + ICP
                 sim3_start = time.time()
-                
-                try:
-                    import open3d as o3d
-                    import open3d.pipelines.registration as treg
-                    
-                    # Create Open3D point clouds
-                    source_pcd = o3d.geometry.PointCloud()
-                    target_pcd = o3d.geometry.PointCloud()
-                    
-                    source_pcd.points = o3d.utility.Vector3dVector(corresponding_points2)  # Next chunk points
-                    target_pcd.points = o3d.utility.Vector3dVector(corresponding_points1)  # Current chunk points
-                    
-                    # Create correspondence set
-                    corres = o3d.utility.Vector2iVector()
-                    for i in range(len(corresponding_points1)):
-                        corres.append([i, i])
-                    
-                    # Set parameters for correspondence-based RANSAC
-                    max_correspondence_distance = self.ransac_max_correspondence_distance
-                    ransac_n = min(6, len(corresponding_points1))  # Number of correspondences for RANSAC (at least 3 for rigid, 6 for similarity)
-                    
-                    try:
-                        # Use correspondence-based RANSAC with explicit point correspondences
-                        ransac_result = treg.registration_ransac_based_on_correspondence(
-                            source_pcd, target_pcd, corres,
-                            max_correspondence_distance,
-                            treg.TransformationEstimationPointToPoint(with_scaling=True),
-                            ransac_n,
-                            criteria=treg.RANSACConvergenceCriteria(max_iteration=self.ransac_max_iterations)
-                        )
-                        print(f"RANSAC result: {ransac_result}")
-                        initial_transformation = ransac_result.transformation
-                        print(f"Correspondence-based RANSAC fitness: {ransac_result.fitness:.4f}")
-                        print(f"Correspondence-based RANSAC inlier RMSE: {ransac_result.inlier_rmse:.6f}")
-                        print(f"Initial transformation matrix:\n{initial_transformation}")
-                        
-                        # Refine with ICP using the initial transformation
-                        icp_result = treg.registration_icp(
-                            source_pcd, target_pcd,
-                            self.icp_threshold, initial_transformation,
-                            treg.TransformationEstimationPointToPoint(with_scaling=False),
-                            treg.ICPConvergenceCriteria(max_iteration=self.icp_max_iterations)
-                        )
-                        
-                        transformation_matrix = icp_result.transformation
-                        print(f"ICP refinement fitness: {icp_result.fitness:.4f}")
-                        print(f"ICP refinement RMSE: {icp_result.inlier_rmse:.6f}")
-                        print(f"Final transformation matrix:\n{transformation_matrix}")
-                        
-                        # Extract scale, rotation, and translation from final transformation
-                        R = transformation_matrix[:3, :3]
-                        t = transformation_matrix[:3, 3]
-                        
-                        # Extract scale from rotation matrix
-                        U, S, Vt = np.linalg.svd(R)
-                        scale = np.mean(S)
-                        
-                        # Normalize rotation matrix
-                        R_normalized = R / scale
-                        
-                        # Ensure proper rotation matrix
-                        U, _, Vt = np.linalg.svd(R_normalized)
-                        R_normalized = U @ Vt
-                        if np.linalg.det(R_normalized) < 0:
-                            Vt[-1, :] *= -1
-                            R_normalized = U @ Vt
-                        
-                        sim3_transform = SIM3Transformation(scale, R_normalized, t)
-                        print(f"  🔧 Robust RANSAC+ICP SIM3 estimation successful (RANSAC fitness: {ransac_result.fitness:.3f}, ICP fitness: {icp_result.fitness:.3f})")
-                        
-                    except Exception as ransac_error:
-                        print(f"  🔧 RANSAC+ICP failed: {ransac_error}, falling back to standard estimation")
-                        sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
-                        
-                except ImportError:
-                    # Fallback to standard estimation if Open3D not available
-                    sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
-                    print(f"  🔧 Open3D not available, using standard SIM3 estimation with {len(corresponding_points1)} points")
-                except Exception as e:
-                    # Fallback to standard estimation on error
-                    sim3_transform = estimate_sim3_transformation(corresponding_points2, corresponding_points1)
-                    print(f"  🔧 Open3D RANSAC+ICP failed: {e}, using standard SIM3 estimation")
-                
+
+                T_source_to_target = self._optimize_sim3_pytheia(
+                    corresponding_points2, corresponding_points1, mean_conf)
+            
                 sim3_time = time.time() - sim3_start
-                
-                # Optimize SIM3 transformation using overlapping camera poses with LM (optional)
-                if self.enable_sim3_optimization:
-                    optimize_start = time.time()
-                    optimized_transform = self._optimize_sim3_transformation(
-                        sim3_transform, current_chunk, chunk_result, 
-                        current_camera_ids, chunk_camera_ids, common_camera_ids
-                    )
-                    optimize_time = time.time() - optimize_start
-                    transformation = optimized_transform.get_matrix()
-                    print(f"  Optimized SIM3 transformation with scale={optimized_transform.s:.3f}")
-                else:
-                    # Skip optimization, use RANSAC+ICP result directly
-                    transformation = sim3_transform.get_matrix()
-                    optimize_time = 0.0
-                    print(f"  Using RANSAC+ICP transformation directly (optimization disabled)")
                 
                 # Apply transformation
                 transform_start = time.time()
-                transformed_points = apply_transformation_to_points(chunk_result['points'], transformation)
-                transformed_poses = apply_transformation_to_poses(chunk_result['camera_poses'], transformation)
+                transformed_points = apply_transformation_to_points(chunk_result['points'], T_source_to_target)
+                transformed_poses = apply_transformation_to_poses(chunk_result['camera_poses'], T_source_to_target)
                 transform_time = time.time() - transform_start
                 
                 # Extract colors for transformed points
@@ -664,11 +583,10 @@ class Pi3SLAMOnlineRerun:
                     'points': transformed_points,
                     'camera_poses': transformed_poses,
                     'colors': aligned_colors,
-                    'transformation': transformation,
+                    'transformation': T_source_to_target,
                     'timing': {
                         'correspondence': correspondence_time,
                         'sim3': sim3_time,
-                        'optimize': optimize_time,
                         'transform': transform_time,
                         'color': color_time
                     }
@@ -767,113 +685,113 @@ class Pi3SLAMOnlineRerun:
             }
         }
     
-    def _optimize_sim3_transformation(self, initial_transform: SIM3Transformation, 
-                                    current_chunk: Dict, next_chunk: Dict,
-                                    current_camera_ids: List[int], next_camera_ids: List[int],
-                                    common_camera_ids: set) -> SIM3Transformation:
-        """
-        Optimize SIM3 transformation using LM least squares on overlapping camera poses.
+    # def _optimize_sim3_transformation(self, initial_transform: SIM3Transformation, 
+    #                                 current_chunk: Dict, next_chunk: Dict,
+    #                                 current_camera_ids: List[int], next_camera_ids: List[int],
+    #                                 common_camera_ids: set) -> SIM3Transformation:
+    #     """
+    #     Optimize SIM3 transformation using LM least squares on overlapping camera poses.
         
-        Args:
-            initial_transform: Initial SIM3 transformation from Open3D RANSAC
-            current_chunk: Current chunk data
-            next_chunk: Next chunk data
-            current_camera_ids: Camera IDs in current chunk
-            next_camera_ids: Camera IDs in next chunk
-            common_camera_ids: Set of overlapping camera IDs
+    #     Args:
+    #         initial_transform: Initial SIM3 transformation from Open3D RANSAC
+    #         current_chunk: Current chunk data
+    #         next_chunk: Next chunk data
+    #         current_camera_ids: Camera IDs in current chunk
+    #         next_camera_ids: Camera IDs in next chunk
+    #         common_camera_ids: Set of overlapping camera IDs
         
-        Returns:
-            Optimized SIM3Transformation
-        """
-        try:
-            from scipy.optimize import least_squares
-            from utils.geometry_utils import rodrigues_to_rotation_matrix, rotation_matrix_to_rodrigues
-        except ImportError:
-            print("  Warning: scipy not available, using initial transformation")
-            return initial_transform
+    #     Returns:
+    #         Optimized SIM3Transformation
+    #     """
+    #     try:
+    #         from scipy.optimize import least_squares
+    #         from utils.geometry_utils import rodrigues_to_rotation_matrix, rotation_matrix_to_rodrigues
+    #     except ImportError:
+    #         print("  Warning: scipy not available, using initial transformation")
+    #         return initial_transform
         
-        # Get overlapping camera poses
-        current_poses = []
-        next_poses = []
+    #     # Get overlapping camera poses
+    #     current_poses = []
+    #     next_poses = []
         
-        for camera_id in sorted(list(common_camera_ids)):
-            current_idx = current_camera_ids.index(camera_id)
-            current_poses.append(current_chunk['camera_poses'][current_idx].numpy())
+    #     for camera_id in sorted(list(common_camera_ids)):
+    #         current_idx = current_camera_ids.index(camera_id)
+    #         current_poses.append(current_chunk['camera_poses'][current_idx].numpy())
             
-            next_idx = next_camera_ids.index(camera_id)
-            next_poses.append(next_chunk['camera_poses'][next_idx].numpy())
+    #         next_idx = next_camera_ids.index(camera_id)
+    #         next_poses.append(next_chunk['camera_poses'][next_idx].numpy())
         
-        if not current_poses:
-            return initial_transform
+    #     if not current_poses:
+    #         return initial_transform
 
-        current_poses = np.stack(current_poses)
-        next_poses = np.stack(next_poses)
+    #     current_poses = np.stack(current_poses)
+    #     next_poses = np.stack(next_poses)
         
-        current_positions = current_poses[:, :3, 3]
-        current_rotations = current_poses[:, :3, :3]
+    #     current_positions = current_poses[:, :3, 3]
+    #     current_rotations = current_poses[:, :3, :3]
         
-        def residual_function(params):
-            """Residual function for least squares optimization."""
-            scale = params[0]
-            rodrigues = params[1:4]
-            translation = params[4:7]
+    #     def residual_function(params):
+    #         """Residual function for least squares optimization."""
+    #         scale = params[0]
+    #         rodrigues = params[1:4]
+    #         translation = params[4:7]
             
-            R = rodrigues_to_rotation_matrix(rodrigues)
+    #         R = rodrigues_to_rotation_matrix(rodrigues)
             
-            T = np.eye(4)
-            T[:3, :3] = scale * R
-            T[:3, 3] = translation
+    #         T = np.eye(4)
+    #         T[:3, :3] = scale * R
+    #         T[:3, 3] = translation
             
-            residuals = []
+    #         residuals = []
             
-            pos_weight = 1.0
-            rot_weight = 0.1
+    #         pos_weight = 1.0
+    #         rot_weight = 0.1
             
-            transformed_poses = T @ next_poses
+    #         transformed_poses = T @ next_poses
             
-            pos_residuals = pos_weight * (current_positions - transformed_poses[:, :3, 3])
-            residuals.append(pos_residuals.flatten())
+    #         pos_residuals = pos_weight * (current_positions - transformed_poses[:, :3, 3])
+    #         residuals.append(pos_residuals.flatten())
             
-            relative_rots = current_rotations @ transformed_poses[:, :3, :3].transpose(0, 2, 1)
+    #         relative_rots = current_rotations @ transformed_poses[:, :3, :3].transpose(0, 2, 1)
             
-            # This part can be slow in a loop. Vectorizing if possible.
-            rot_residuals = rot_weight * np.array([rotation_matrix_to_rodrigues(m) for m in relative_rots])
-            residuals.append(rot_residuals.flatten())
+    #         # This part can be slow in a loop. Vectorizing if possible.
+    #         rot_residuals = rot_weight * np.array([rotation_matrix_to_rodrigues(m) for m in relative_rots])
+    #         residuals.append(rot_residuals.flatten())
             
-            return np.concatenate(residuals)
+    #         return np.concatenate(residuals)
         
-        initial_rodrigues = rotation_matrix_to_rodrigues(initial_transform.R)
+    #     initial_rodrigues = rotation_matrix_to_rodrigues(initial_transform.R)
         
-        initial_params = np.concatenate([
-            [initial_transform.s],
-            initial_rodrigues,
-            initial_transform.t
-        ])
+    #     initial_params = np.concatenate([
+    #         [initial_transform.s],
+    #         initial_rodrigues,
+    #         initial_transform.t
+    #     ])
         
-        try:
-            res = least_squares(
-                residual_function,
-                initial_params,
-                method='lm',
-                verbose=0,
-                ftol=1e-4,
-                xtol=1e-4,
-                gtol=1e-4
-            )
+    #     try:
+    #         res = least_squares(
+    #             residual_function,
+    #             initial_params,
+    #             method='lm',
+    #             verbose=0,
+    #             ftol=1e-4,
+    #             xtol=1e-4,
+    #             gtol=1e-4
+    #         )
             
-            if res.success:
-                optimized_scale = res.x[0]
-                optimized_rodrigues = res.x[1:4]
-                optimized_translation = res.x[4:7]
-                optimized_rotation = rodrigues_to_rotation_matrix(optimized_rodrigues)
+    #         if res.success:
+    #             optimized_scale = res.x[0]
+    #             optimized_rodrigues = res.x[1:4]
+    #             optimized_translation = res.x[4:7]
+    #             optimized_rotation = rodrigues_to_rotation_matrix(optimized_rodrigues)
                 
-                return SIM3Transformation(optimized_scale, optimized_rotation, optimized_translation)
-            else:
-                print(f"  LM optimization failed: {res.message}, using initial transformation")
-                return initial_transform
-        except Exception as e:
-            print(f"  Warning: LM optimization failed: {e}, using initial transformation")
-            return initial_transform
+    #             return SIM3Transformation(optimized_scale, optimized_rotation, optimized_translation)
+    #         else:
+    #             print(f"  LM optimization failed: {res.message}, using initial transformation")
+    #             return initial_transform
+    #     except Exception as e:
+    #         print(f"  Warning: LM optimization failed: {e}, using initial transformation")
+    #         return initial_transform
     
     def _manage_memory(self):
         """Manage memory by moving old chunks to disk and keeping only recent ones in memory."""

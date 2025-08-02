@@ -6,8 +6,8 @@ output_dir="logs/7scenes"
 groundtruth_dir="scripts/groundtruths/7scenes"
 
 # Default parameters
-overlap=${1:-10}
-chunk_length=${2:-50}
+overlap=${1:-20}
+chunk_length=${2:-100}
 enable_sim3_optimization=${3:-true}
 
 # Create output directories
@@ -55,11 +55,7 @@ for dataset in ${datasets[@]}; do
         --save_tum \
         --overlap \"$overlap\" \
         --chunk_length \"$chunk_length\" \
-        --conf_threshold 0.5 \
-        --ransac_distance 0.01 \
-        --ransac_iterations 100 \
-        --icp_threshold 0.01 \
-        --icp_iterations 5 \
+        --conf_threshold 0.4 \
         --rerun_port 9090 \
         --tum_integer_timestamp"
     

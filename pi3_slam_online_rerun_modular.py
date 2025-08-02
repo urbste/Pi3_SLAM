@@ -114,7 +114,8 @@ def main():
     parser = argparse.ArgumentParser(description='Pi3SLAM Online with Rerun visualization')
     
     # Input options
-    parser.add_argument('--image_dir', type=str, help='Directory containing images')
+    parser.add_argument('--image_dir', type=str, help='Directory containing images', 
+                        default='/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/')
     parser.add_argument('--video_path', type=str, help='Path to video file')
     parser.add_argument('--start_frame', type=int, default=0, help='Starting frame for video')
     parser.add_argument('--end_frame', type=int, default=None, help='Ending frame for video')
@@ -126,16 +127,12 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to run on (cuda/cpu)')
     
     # Processing options
-    parser.add_argument('--chunk_length', type=int, default=50, help='Number of frames per chunk')
-    parser.add_argument('--overlap', type=int, default=10, help='Number of overlapping frames between chunks')
+    parser.add_argument('--chunk_length', type=int, default=10, help='Number of frames per chunk')
+    parser.add_argument('--overlap', type=int, default=5, help='Number of overlapping frames between chunks')
     parser.add_argument('--conf_threshold', type=float, default=0.5, help='Confidence threshold for filtering points')
     parser.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
     
     # Alignment options
-    parser.add_argument('--ransac_distance', type=float, default=0.01, help='RANSAC max correspondence distance')
-    parser.add_argument('--ransac_iterations', type=int, default=100, help='RANSAC max iterations')
-    parser.add_argument('--icp_threshold', type=float, default=0.01, help='ICP distance threshold')
-    parser.add_argument('--icp_iterations', type=int, default=100, help='ICP max iterations')
     parser.add_argument('--no_sim3_optimization', action='store_true', help='Disable SIM3 optimization after RANSAC+ICP')
     
     # Undistortion options
@@ -232,15 +229,6 @@ def main():
         enable_sim3_optimization=not args.no_sim3_optimization
     )
     
-    # Configure robust alignment parameters
-    print("🔧 Configuring robust alignment parameters...")
-    slam.configure_alignment(
-        ransac_max_correspondence_distance=args.ransac_distance,
-        ransac_max_iterations=args.ransac_iterations,
-        icp_threshold=args.icp_threshold,
-        icp_max_iterations=args.icp_iterations
-    )
-    
     # Start background loader
     print("🔄 Starting background image loader...")
     slam.start_background_loader(image_paths)
@@ -264,13 +252,7 @@ def main():
         print(f"Total frames processed: {stats['total_frames']}")
         print(f"Total processing time: {stats.get('total_processing_time', 0):.2f}s")
         print(f"Overall FPS: {stats.get('overall_fps', 0):.1f}")
-        
-        # Print alignment configuration
-        print(f"\n🔧 Alignment Configuration:")
-        print(f"   RANSAC distance threshold: {args.ransac_distance}")
-        print(f"   RANSAC max iterations: {args.ransac_iterations}")
-        print(f"   ICP distance threshold: {args.icp_threshold}")
-        print(f"   ICP max iterations: {args.icp_iterations}")
+    
         
         # Save results
         print(f"\n💾 Saving results to: {args.output_path}")

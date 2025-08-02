@@ -15,3 +15,5 @@ __pycache__
 *.log
 *.gif
 output/
+
+*.sfm

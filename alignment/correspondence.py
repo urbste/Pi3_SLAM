@@ -5,7 +5,6 @@ Correspondence finding utilities for Pi3SLAM alignment.
 import torch
 import numpy as np
 from typing import List, Tuple
-from alignment.sim3_transformation import detect_outliers_using_mahalanobis, estimate_sim3_transformation
 import open3d as o3d
 
 
@@ -44,7 +43,9 @@ def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor,
     # Pre-allocate lists for better performance
     all_corr_points1 = []
     all_corr_points2 = []
-    
+    all_corr_conf1 = []
+    all_corr_conf2 = []
+
     for cam_id in common_ids:
         idx1 = camera_ids1.index(cam_id)
         idx2 = camera_ids2.index(cam_id)
@@ -79,23 +80,31 @@ def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor,
             # Use boolean indexing for efficient selection
             points1_selected = pts1[valid_pts]
             points2_selected = pts2[valid_pts]
-            
+            conf1_selected = cam_conf1[valid_pts]
+            conf2_selected = cam_conf2[valid_pts]
+
             # Extend lists efficiently
             all_corr_points1.extend(points1_selected)
             all_corr_points2.extend(points2_selected)
+            all_corr_conf1.extend(conf1_selected)
+            all_corr_conf2.extend(conf2_selected)
     
     if not all_corr_points1:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([])
     
     # Convert to numpy arrays efficiently
     all_points1 = np.array(all_corr_points1)
     all_points2 = np.array(all_corr_points2)
+    all_conf1 = np.array(all_corr_conf1)
+    all_conf2 = np.array(all_corr_conf2)
     
     # Ensure equal number of points
     min_total = min(len(all_points1), len(all_points2))
     if min_total > 0:
         all_points1 = all_points1[:min_total]
         all_points2 = all_points2[:min_total]
+        all_conf1 = all_conf1[:min_total]
+        all_conf2 = all_conf2[:min_total]
         
         # Apply robust outlier filtering if enabled and we have enough points
         if use_robust_filtering and len(all_points1) >= 10:
@@ -114,7 +123,7 @@ def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor,
                 
             except Exception as e:
                 print(f"  ⚠️  Robust filtering failed: {e}, using all points")
-        
-        return all_points1, all_points2
+        # return als confidencce for all_points1
+        return all_points1, all_points2, (all_conf1 + all_conf2) / 2
     else:
-        return np.array([]), np.array([]) 
+        return np.array([]), np.array([]), np.array([])
