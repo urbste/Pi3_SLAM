@@ -121,8 +121,8 @@ def apply_transformation_to_points(points: torch.Tensor, transformation: np.ndar
     points_homog = homogenize_points(points)
     transformation_tensor = torch.from_numpy(transformation).to(torch.float32)
     transformed_points_homog = (transformation_tensor @ points_homog.view(-1, 4).T).T
-    transformed_points_homog = transformed_points_homog.view(points.shape[0], points.shape[1], points.shape[2], 4)
-    return transformed_points_homog[:,:,:,:3]
+    transformed_points_homog = transformed_points_homog.view(points.shape[0], points.shape[1], 4)
+    return transformed_points_homog[:,:,:3]
 
 
 def apply_transformation_to_poses(poses: torch.Tensor, transformation: np.ndarray) -> torch.Tensor:

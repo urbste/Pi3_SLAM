@@ -238,7 +238,7 @@ def recover_intrinsics_from_points(result: dict, images_tensor: torch.Tensor) ->
     result["shift"] = result["shift"] * scale_factor
 
 
-    from lightglue import ALIKED, SIFT, SuperPoint
+    from lightglue import ALIKED
     aliked_extractor = ALIKED(max_num_keypoints=512, detection_threshold=0.005).to(points.device).eval()
     keypoints = aliked_extractor({"image": images_tensor[[0], ref_id].to(points.device)})["keypoints"]
 

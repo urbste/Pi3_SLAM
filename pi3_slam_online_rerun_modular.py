@@ -135,6 +135,18 @@ def main():
     # Alignment options
     parser.add_argument('--no_sim3_optimization', action='store_true', help='Disable SIM3 optimization after RANSAC+ICP')
     
+    # Camera parameter estimation options
+    parser.add_argument('--estimate_camera_params', default=True, help='Enable camera parameter estimation for each chunk')
+    
+    # Keypoint extraction options
+    parser.add_argument('--extract_keypoints', default=True, help='Enable ALIKED keypoint extraction for each chunk')
+    parser.add_argument('--max_num_keypoints', type=int, default=1024, help='Maximum number of keypoints to extract per frame')
+    parser.add_argument('--keypoint_detection_threshold', type=float, default=0.005, help='Detection threshold for keypoints')
+    
+    # Chunk reconstruction options
+    parser.add_argument('--create_chunk_reconstruction', default=True, help='Enable PyTheia chunk reconstruction')
+    parser.add_argument('--save_chunk_reconstructions', default=True, help='Save each chunk reconstruction to disk')
+    
     # Undistortion options
     parser.add_argument('--cam_dist_path', type=str, help='Path to camera calibration file for undistortion')
     
@@ -148,7 +160,7 @@ def main():
     parser.add_argument('--no_visualization', action='store_true', help='Disable Rerun visualization')
     
     # Output options
-    parser.add_argument('--output_path', type=str, default='output/trajectory.ply', help='Output path for trajectory')
+    parser.add_argument('--output_path', type=str, default='/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced_result/    ', help='Output path for trajectory')
     parser.add_argument('--max_points', type=int, default=1000000, help='Maximum points to save')
     parser.add_argument('--save_tum', action='store_true', help='Save trajectory in TUM format for evaluation')
     parser.add_argument('--tum_integer_timestamp', action='store_true', help='Use integer timestamps in TUM output (for 7-scenes)')
@@ -226,8 +238,25 @@ def main():
         enable_disk_cache=args.enable_disk_cache,
         cache_dir=args.cache_dir,
         rerun_port=args.rerun_port,
-        enable_sim3_optimization=not args.no_sim3_optimization
+        enable_sim3_optimization=not args.no_sim3_optimization,
+        estimate_camera_params=args.estimate_camera_params,
+        extract_keypoints=args.extract_keypoints,
+        max_num_keypoints=args.max_num_keypoints,
+        keypoint_detection_threshold=args.keypoint_detection_threshold,
+        create_chunk_reconstruction=args.create_chunk_reconstruction,
+        save_chunk_reconstructions=args.save_chunk_reconstructions
     )
+    
+    # Set output directory for chunk reconstructions if saving is enabled
+    if args.save_chunk_reconstructions:
+        # Determine output directory from output path
+        if os.path.isdir(args.output_path) or args.output_path.endswith('/'):
+            output_dir = args.output_path
+        else:
+            output_dir = os.path.dirname(args.output_path)
+        
+        slam.set_output_directory(output_dir)
+        print(f"💾 Chunk reconstructions will be saved to: {os.path.join(output_dir, 'reconstructions')}")
     
     # Start background loader
     print("🔄 Starting background image loader...")
@@ -250,8 +279,6 @@ def main():
         stats = slam.get_statistics()
         print(f"Total chunks processed: {stats['total_chunks']}")
         print(f"Total frames processed: {stats['total_frames']}")
-        print(f"Total processing time: {stats.get('total_processing_time', 0):.2f}s")
-        print(f"Overall FPS: {stats.get('overall_fps', 0):.1f}")
     
         
         # Save results

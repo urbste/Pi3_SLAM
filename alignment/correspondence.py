@@ -12,9 +12,7 @@ def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor,
                             camera_ids1: List[int], camera_ids2: List[int],
                             conf1: torch.Tensor = None, conf2: torch.Tensor = None,
                             subsample_factor: int = 4,
-                            conf_threshold: float = 0.5, 
-                            threshold: float = 0.1,
-                            use_robust_filtering: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                            conf_threshold: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
     """
     Find corresponding points between two chunks based on camera IDs, using confidence filtering.
     Optimized for speed with aggressive subsampling and vectorized operations.
@@ -105,24 +103,7 @@ def find_corresponding_points(points1: torch.Tensor, points2: torch.Tensor,
         all_points2 = all_points2[:min_total]
         all_conf1 = all_conf1[:min_total]
         all_conf2 = all_conf2[:min_total]
-        
-        # Apply robust outlier filtering if enabled and we have enough points
-        if use_robust_filtering and len(all_points1) >= 10:
-            try:
-                # Initial transformation for outlier detection
-                initial_transform = estimate_sim3_transformation(all_points1, all_points2)
-                
-                # Detect outliers using Mahalanobis distance
-                inlier_mask = detect_outliers_using_mahalanobis(all_points1, all_points2, initial_transform)
-                
-                # Keep only inliers
-                if np.sum(inlier_mask) >= 5:  # Need at least 5 points for robust estimation
-                    all_points1 = all_points1[inlier_mask]
-                    all_points2 = all_points2[inlier_mask]
-                    print(f"  🔍 Robust filtering: {len(inlier_mask)} -> {len(all_points1)} points ({np.sum(inlier_mask)/len(inlier_mask)*100:.1f}% inliers)")
-                
-            except Exception as e:
-                print(f"  ⚠️  Robust filtering failed: {e}, using all points")
+
         # return als confidencce for all_points1
         return all_points1, all_points2, (all_conf1 + all_conf2) / 2
     else:
