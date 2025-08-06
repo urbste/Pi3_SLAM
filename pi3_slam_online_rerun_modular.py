@@ -127,8 +127,8 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to run on (cuda/cpu)')
     
     # Processing options
-    parser.add_argument('--chunk_length', type=int, default=10, help='Number of frames per chunk')
-    parser.add_argument('--overlap', type=int, default=5, help='Number of overlapping frames between chunks')
+    parser.add_argument('--chunk_length', type=int, default=20, help='Number of frames per chunk')
+    parser.add_argument('--overlap', type=int, default=10, help='Number of overlapping frames between chunks')
     parser.add_argument('--conf_threshold', type=float, default=0.5, help='Confidence threshold for filtering points')
     parser.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
     

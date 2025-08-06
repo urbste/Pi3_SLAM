@@ -4,10 +4,9 @@ Chunk-based PyTheia reconstruction utilities for Pi3SLAM.
 
 import torch
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import pytheia as pt
 from pi3.utils.camera import Camera
-
 
 class ChunkPTRecon:
     """
@@ -133,23 +132,23 @@ class ChunkPTRecon:
                     pt.sfm.Feature(keypoints_2d[kp_idx])
                 )
             
-            # Project keypoints to all subsequent frames
-            next_frames = list(range(frame_idx + 1, num_frames))
+            # Project keypoints to ALL other frames in the chunk
+            all_other_frames = [i for i in range(num_frames) if i != frame_idx]
             
-            if next_frames:
-                # Project points to neighboring frames
+            if all_other_frames:
+                # Project points to all other frames
                 projected_points = self._project_points_to_other_cams(
-                    chunk_data, frame_idx, next_frames
+                    chunk_data, frame_idx, all_other_frames
                 )
                 
                 # Add observations for projected points
-                for next_frame_idx, projected_kps in zip(next_frames, projected_points):
+                for other_frame_idx, projected_kps in zip(all_other_frames, projected_points):
                     for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
                         # Check if projected point is within image bounds
                         if (0 <= projected_pt[0] < self.original_width and 
                             0 <= projected_pt[1] < self.original_height):
                             self.reconstruction.AddObservation(
-                                self.view_ids[next_frame_idx],
+                                self.view_ids[other_frame_idx],
                                 track_id,
                                 pt.sfm.Feature(projected_pt)
                             )

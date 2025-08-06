@@ -24,6 +24,7 @@ from utils.chunk_reconstruction import ChunkPTRecon
 from alignment.correspondence import find_corresponding_points
 from datasets.image_datasets import ChunkImageDataset
 from visualization.rerun_visualizer import visualization_process
+import cv2
 
 
 class Pi3SLAMOnlineRerun:
@@ -372,6 +373,8 @@ class Pi3SLAMOnlineRerun:
             
             # Create reconstruction
             chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(cpu_result)
+            #self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 
+            #                                           save_path="custom_projection_"+str(len(self.chunk_results))+".gif", fps=1)
             self.chunk_reconstructor.print_reconstruction_summary()
             
             # Save chunk reconstruction if enabled
@@ -543,6 +546,9 @@ class Pi3SLAMOnlineRerun:
         overlap_cameras_next = chunk_camera_ids[:self.overlap] if len(chunk_camera_ids) >= self.overlap else chunk_camera_ids
         
         common_camera_ids = set(overlap_cameras_current) & set(overlap_cameras_next)
+        
+        # Debug: Print overlap information
+        self._debug_print_overlap_indices(overlap_cameras_current, overlap_cameras_next, common_camera_ids, chunk_result)
         
         if len(common_camera_ids) >= 2:
             # Use keypoint points for alignment if available
@@ -1128,4 +1134,61 @@ class Pi3SLAMOnlineRerun:
         return {
             'total_chunks': len(self.chunk_results),
             'total_frames': len(self.timestamps)
-        } 
+        }
+    
+    def _debug_print_overlap_indices(self, overlap_cameras_current: List[int], overlap_cameras_next: List[int], 
+                                   common_camera_ids: set, chunk_result: Dict) -> None:
+        """
+        Debug function to print overlap indices and statistics during chunk alignment.
+        
+        Args:
+            overlap_cameras_current: Camera IDs from current chunk that overlap
+            overlap_cameras_next: Camera IDs from next chunk that overlap
+            common_camera_ids: Set of common camera IDs between chunks
+            chunk_result: Current chunk result data
+        """
+        print(f"\n🔍 CHUNK OVERLAP DEBUG:")
+        print(f"   Current chunk overlap cameras: {overlap_cameras_current}")
+        print(f"   Next chunk overlap cameras: {overlap_cameras_next}")
+        print(f"   Common camera IDs: {sorted(common_camera_ids)}")
+        print(f"   Number of common cameras: {len(common_camera_ids)}")
+        
+        # Print overlap indices for keypoints if available
+        if 'points_kp' in chunk_result:
+            num_keypoints = chunk_result['points_kp'].shape[1] if len(chunk_result['points_kp'].shape) > 1 else chunk_result['points_kp'].shape[0]
+            print(f"   Keypoints in current chunk: {num_keypoints}")
+            
+            # Calculate overlap indices based on common cameras
+            overlap_indices = []
+            for cam_id in common_camera_ids:
+                if cam_id in overlap_cameras_current:
+                    # This camera is in the overlap region of current chunk
+                    # The indices would be the keypoints from this camera
+                    # For now, just note which cameras are overlapping
+                    overlap_indices.append(f"cam_{cam_id}")
+            
+            print(f"   Overlap camera indices: {overlap_indices}")
+        
+        # Print point cloud statistics
+        if 'points' in chunk_result:
+            points_shape = chunk_result['points'].shape
+            print(f"   Point cloud shape: {points_shape}")
+            
+            if len(points_shape) == 4:  # (N, H, W, 3)
+                total_points = points_shape[0] * points_shape[1] * points_shape[2]
+                print(f"   Total points in chunk: {total_points}")
+            elif len(points_shape) == 3:  # (N, M, 3)
+                total_points = points_shape[0] * points_shape[1]
+                print(f"   Total points in chunk: {total_points}")
+        
+        # Print confidence statistics if available
+        if 'conf' in chunk_result:
+            conf_shape = chunk_result['conf'].shape
+            print(f"   Confidence shape: {conf_shape}")
+            if len(conf_shape) > 0:
+                mean_conf = chunk_result['conf'].mean().item()
+                print(f"   Mean confidence: {mean_conf:.3f}")
+        
+        print(f"   Overlap size: {self.overlap}")
+        print(f"   Chunk length: {self.chunk_length}")
+        print("-" * 50) 
