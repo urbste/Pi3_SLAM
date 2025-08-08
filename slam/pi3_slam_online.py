@@ -7,7 +7,7 @@ import numpy as np
 import time
 import multiprocessing as mp
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from torch.utils.data import DataLoader
 
 from pi3.models.pi3 import Pi3
@@ -21,6 +21,12 @@ from utils.timestamp_utils import extract_timestamps_from_paths
 from utils.camera_estimation import estimate_camera_parameters_single_chunk, print_camera_parameters_summary
 from utils.keypoint_extraction import ALIKEDExtractor
 from utils.chunk_reconstruction import ChunkPTRecon
+from utils.reconstruction_alignment import (
+    create_view_graph_matches, 
+    align_reconstructions_sim3,
+    align_and_refine_reconstructions
+)
+import pytheia as pt
 from alignment.correspondence import find_corresponding_points
 from datasets.image_datasets import ChunkImageDataset
 from visualization.rerun_visualizer import visualization_process
@@ -37,7 +43,7 @@ class Pi3SLAMOnlineRerun:
                  device: str = 'cuda', conf_threshold: float = 0.5, 
                  undistortion_maps=None, cam_scale: float = 1.0,
                  max_chunks_in_memory: int = 5, enable_disk_cache: bool = False,
-                 cache_dir: str = None, rerun_port: int = 9090, enable_sim3_optimization: bool = True,
+                 cache_dir: str = None, rerun_port: int = 9090, 
                  estimate_camera_params: bool = False, extract_keypoints: bool = False,
                  max_num_keypoints: int = 512, keypoint_detection_threshold: float = 0.005,
                  create_chunk_reconstruction: bool = False, save_chunk_reconstructions: bool = False):
@@ -93,6 +99,18 @@ class Pi3SLAMOnlineRerun:
         self.aligned_camera_poses = []
         self.aligned_camera_ids = []
         self.aligned_colors = []
+        
+        # Pytheia reconstructions storage (in-memory)
+        self.chunk_reconstructions = []
+        
+        # Reconstruction alignment settings
+        self.use_reconstruction_alignment = True
+        self.feature_match_threshold = 5.0  # pixels
+        self.descriptor_match_threshold = 0.8  # normalized distance
+        self.min_common_tracks = 10  # minimum tracks needed for alignment
+        self.use_reconstruction_refinement = True  # Enable full refinement pipeline
+        self.save_transformed_reconstructions = False  # Save PLY files of transformed reconstructions
+        self.save_debug_reconstructions = True  # Save debug files for all reconstruction stages
         
         # Keypoint data structures for visualization
         self.aligned_keypoint_points = None
@@ -362,25 +380,29 @@ class Pi3SLAMOnlineRerun:
         
         # Create chunk reconstruction if enabled
         chunk_reconstruction = None
-        if self.create_chunk_reconstruction and self.chunk_reconstructor is not None and keypoint_results is not None:
-            # Set target size for reconstruction
-            if hasattr(self, 'target_size') and self.target_size is not None:
-                self.chunk_reconstructor.set_target_size(self.target_size[0], self.target_size[1])
-            
-            # Add camera intrinsics if available
-            if camera_params is not None:
-                cpu_result['intrinsics'] = camera_params['intrinsics']
-            
-            # Create reconstruction
-            chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(cpu_result)
-            #self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 
-            #                                           save_path="custom_projection_"+str(len(self.chunk_results))+".gif", fps=1)
-            self.chunk_reconstructor.print_reconstruction_summary()
-            
-            # Save chunk reconstruction if enabled
-            if self.save_chunk_reconstructions:
-                self._save_chunk_reconstruction(chunk_reconstruction, len(self.chunk_results))
         
+        # Set target size for reconstruction
+        if hasattr(self, 'target_size') and self.target_size is not None:
+            self.chunk_reconstructor.set_target_size(self.target_size[0], self.target_size[1])
+        
+        # Add camera intrinsics if available
+        if camera_params is not None:
+            cpu_result['intrinsics'] = camera_params['intrinsics']
+        
+        # Create reconstruction
+        chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(cpu_result)
+        #self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 
+        #                                           save_path="custom_projection_"+str(len(self.chunk_results))+".gif", fps=1)
+        self.chunk_reconstructor.print_reconstruction_summary()
+        
+        # Store reconstruction in memory instead of saving to disk in online mode
+        self.chunk_reconstructions.append(chunk_reconstruction)
+        print(f"💾 Stored chunk reconstruction {len(self.chunk_results)} in memory")
+        
+        # Only save to disk if explicitly enabled (for offline processing)
+        if self.save_chunk_reconstructions:
+            self._save_chunk_reconstruction(chunk_reconstruction, len(self.chunk_results))
+    
         # Print camera parameters summary (if estimated)
         if camera_params is not None:
             print_camera_parameters_summary(camera_params)
@@ -537,6 +559,9 @@ class Pi3SLAMOnlineRerun:
                 'transformation': np.eye(4)
             }
         
+        # Try reconstruction-based alignment first if reconstructions are available
+        transformation_matrix = self.align_with_reconstruction_tracks(chunk_result, chunk_camera_ids)
+        
         # Align with current reference chunk (like offline version)
         current_chunk = self.current_reference_chunk
         current_camera_ids = self.current_reference_camera_ids
@@ -576,11 +601,18 @@ class Pi3SLAMOnlineRerun:
                 subsample_factor=self.correspondence_subsample_factor,  # Use configurable subsampling
                 conf_threshold=self.conf_threshold,
             )
-            
+
+
             if len(corresponding_points1) >= 10:
-                # Estimate SIM3 transformation using robust Open3D RANSAC + ICP
-                T_source_to_target = self._optimize_sim3_pytheia(
-                    corresponding_points2, corresponding_points1, mean_conf)
+                # Use reconstruction-based transformation if available, otherwise estimate from point correspondences
+                if transformation_matrix is not None:
+                    print("🔧 Using reconstruction-based transformation")
+                    T_source_to_target = transformation_matrix
+                else:
+                    print("🔧 Using point correspondence-based transformation")
+                    # Estimate SIM3 transformation using robust Open3D RANSAC + ICP
+                    T_source_to_target = self._optimize_sim3_pytheia(
+                        corresponding_points2, corresponding_points1, mean_conf)
                 
                 # Apply transformation to both full points and keypoint points
                 N, H, W, _ = chunk_result['points'].shape
@@ -827,6 +859,148 @@ class Pi3SLAMOnlineRerun:
         self.output_dir = output_dir
         print(f"📁 Output directory set to: {output_dir}")
     
+    def get_chunk_reconstructions(self):
+        """
+        Get list of all stored Pytheia reconstructions.
+        
+        Returns:
+            List of PyTheia reconstruction objects
+        """
+        return self.chunk_reconstructions
+    
+    def get_latest_reconstruction(self):
+        """
+        Get the most recent Pytheia reconstruction.
+        
+        Returns:
+            Latest PyTheia reconstruction object or None if no reconstructions exist
+        """
+        return self.chunk_reconstructions[-1] if self.chunk_reconstructions else None
+    
+    def get_reconstruction_count(self):
+        """
+        Get the number of stored reconstructions.
+        
+        Returns:
+            Number of reconstructions in memory
+        """
+        return len(self.chunk_reconstructions)
+    
+    def save_reconstructions_to_disk(self, output_dir: str = None):
+        """
+        Save all stored reconstructions to disk.
+        
+        Args:
+            output_dir: Output directory (uses self.output_dir if None)
+        """
+        if output_dir is None:
+            output_dir = getattr(self, 'output_dir', None)
+        
+        if output_dir is None:
+            print("⚠️  Warning: No output directory specified for saving reconstructions")
+            return
+        
+        import pytheia as pt
+        
+        # Create reconstructions subdirectory
+        recon_dir = os.path.join(output_dir, 'reconstructions')
+        os.makedirs(recon_dir, exist_ok=True)
+        
+        print(f"💾 Saving {len(self.chunk_reconstructions)} reconstructions to {recon_dir}")
+        
+        for idx, reconstruction in enumerate(self.chunk_reconstructions):
+            if reconstruction is not None:
+                try:
+                    # Save SFM reconstruction
+                    recon_filename = f"chunk_{idx:06d}.sfm"
+                    recon_path = os.path.join(recon_dir, recon_filename)
+                    pt.io.WriteReconstruction(reconstruction, recon_path)
+                    
+                    # Save PLY point cloud
+                    ply_filename = f"chunk_{idx:06d}.ply"
+                    ply_path = os.path.join(recon_dir, ply_filename)
+                    color = [255, 255, 255]  # White color for points
+                    pt.io.WritePlyFile(ply_path, reconstruction, color, 1)
+                    
+                    print(f"   ✅ Saved chunk {idx}: {recon_filename} & {ply_filename}")
+                    
+                except Exception as e:
+                    print(f"   ❌ Failed to save chunk {idx}: {e}")
+        
+        print(f"✅ Reconstruction saving completed")
+    
+    def align_with_reconstruction_tracks(self, chunk_result: Dict, chunk_camera_ids: List[int]) -> Optional[np.ndarray]:
+        """
+        Align the current chunk with the previous chunk using common tracks in PyTheia reconstructions.
+        
+        Args:
+            chunk_result: Current chunk result
+            chunk_camera_ids: Camera IDs for current chunk
+            
+        Returns:
+            Transformation matrix (4x4) if alignment successful, None otherwise
+        """
+        if len(self.chunk_reconstructions) < 2:
+            print("🔍 Skipping reconstruction-based alignment: need at least 2 reconstructions")
+            return None
+        
+        if not self.use_reconstruction_alignment:
+            print("🔍 Reconstruction-based alignment disabled")
+            return None
+        
+        try:
+            # Get the two most recent reconstructions
+            recon_ref = self.chunk_reconstructions[-2]  # Previous chunk
+            recon_qry = self.chunk_reconstructions[-1]  # Current chunk
+            
+            print(f"\n🔄 Aligning current chunk using PyTheia reconstructions...")
+            
+            # Create view graph matches for overlapping frames
+            view_graph_matches = create_view_graph_matches(self.chunk_length, self.overlap)
+            print(f"🔍 View graph matches: {view_graph_matches}")
+            
+            print("🔧 Using complete reconstruction refinement pipeline...")
+            
+            # Generate PLY save path if enabled
+            save_ply_path = None
+            if self.save_transformed_reconstructions and hasattr(self, 'output_dir') and self.output_dir:
+                chunk_idx = len(self.chunk_reconstructions) - 1
+                save_ply_path = os.path.join(self.output_dir, f"chunk_{chunk_idx:06d}_transformed.ply")
+            
+            # Perform complete alignment and refinement
+            debug_output_dir = None
+            if self.save_debug_reconstructions and hasattr(self, 'output_dir') and self.output_dir:
+                debug_output_dir = os.path.join(self.output_dir, 'debug_reconstructions')
+            
+            success, alignment_info = align_and_refine_reconstructions(
+                recon_ref, recon_qry, view_graph_matches,
+                self.feature_match_threshold, self.descriptor_match_threshold,
+                save_ply_path, self.save_debug_reconstructions, debug_output_dir,
+                len(self.chunk_reconstructions) - 1  # chunk index
+            )
+            
+            if success:
+                print(f"✅ Complete reconstruction alignment successful:")
+                print(f"   Common tracks: {alignment_info['num_common_tracks']}")
+                print(f"   Sim3 error: {alignment_info['sim3_summary']['alignment_error']:.6f}")
+                print(f"   BA final cost: {alignment_info['bundle_adjustment']['final_cost']:.6f}")
+                
+                # Return the Sim3 transformation matrix
+                import pytheia as pt
+                sim3_params = alignment_info['sim3_summary']['sim3_params']
+                transformation_matrix = pt.math.Sim3d.exp(sim3_params).matrix()
+                return transformation_matrix
+            else:
+                print(f"❌ Complete reconstruction alignment failed: {alignment_info.get('error', 'unknown')}")
+                return None
+            
+            
+        except Exception as e:
+            print(f"❌ Reconstruction-based alignment failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def _manage_memory(self):
         """Manage memory by moving old chunks to disk and keeping only recent ones in memory."""
         if len(self.aligned_points) <= self.max_chunks_in_memory:
@@ -850,13 +1024,19 @@ class Pi3SLAMOnlineRerun:
                 self.aligned_points[chunk_idx] = None
                 self.aligned_colors[chunk_idx] = None
                 self.aligned_camera_poses[chunk_idx] = None
+                
+                # Also clear old reconstructions to manage memory (keep last max_chunks_in_memory)
+                if self.chunk_reconstructions and chunk_idx < len(self.chunk_reconstructions):
+                    self.chunk_reconstructions[chunk_idx] = None
         
         # Compact lists by removing None entries
         self.aligned_points = [p for p in self.aligned_points if p is not None]
         self.aligned_colors = [c for c in self.aligned_colors if c is not None]
         self.aligned_camera_poses = [p for p in self.aligned_camera_poses if p is not None]
+        self.chunk_reconstructions = [r for r in self.chunk_reconstructions if r is not None]
         
         print(f"💾 Moved {chunks_to_move} chunks to disk, keeping {len(self.aligned_points)} in memory")
+        print(f"🔧 Keeping {len(self.chunk_reconstructions)} reconstructions in memory")
         print(f"📷 Camera trajectory: {len(self.full_camera_trajectory)} poses, {len(self.chunk_end_poses)} chunk end poses")
         
         # Log memory usage if monitoring is enabled
@@ -893,7 +1073,7 @@ class Pi3SLAMOnlineRerun:
                 if points is not None:
                     total_points_in_memory += len(points)
             
-            print(f"🧠 Memory usage: {memory_mb:.1f} MB, Points in memory: {total_points_in_memory:,}, Camera poses: {len(self.full_camera_trajectory):,}, Chunk end poses: {len(self.chunk_end_poses)}")
+            print(f"🧠 Memory usage: {memory_mb:.1f} MB, Points in memory: {total_points_in_memory:,}, Camera poses: {len(self.full_camera_trajectory):,}, Chunk end poses: {len(self.chunk_end_poses)}, Reconstructions: {len(self.chunk_reconstructions)}")
             
         except ImportError:
             # psutil not available, skip memory logging

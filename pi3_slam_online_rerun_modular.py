@@ -128,12 +128,9 @@ def main():
     
     # Processing options
     parser.add_argument('--chunk_length', type=int, default=20, help='Number of frames per chunk')
-    parser.add_argument('--overlap', type=int, default=10, help='Number of overlapping frames between chunks')
+    parser.add_argument('--overlap', type=int, default=5, help='Number of overlapping frames between chunks')
     parser.add_argument('--conf_threshold', type=float, default=0.5, help='Confidence threshold for filtering points')
     parser.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
-    
-    # Alignment options
-    parser.add_argument('--no_sim3_optimization', action='store_true', help='Disable SIM3 optimization after RANSAC+ICP')
     
     # Camera parameter estimation options
     parser.add_argument('--estimate_camera_params', default=True, help='Enable camera parameter estimation for each chunk')
@@ -146,6 +143,8 @@ def main():
     # Chunk reconstruction options
     parser.add_argument('--create_chunk_reconstruction', default=True, help='Enable PyTheia chunk reconstruction')
     parser.add_argument('--save_chunk_reconstructions', default=True, help='Save each chunk reconstruction to disk')
+    parser.add_argument('--save_transformed_reconstructions', default=True, help='Save transformed reconstructions as PLY files')
+    parser.add_argument('--save_debug_reconstructions', default=True, help='Save debug files for all reconstruction stages')
     
     # Undistortion options
     parser.add_argument('--cam_dist_path', type=str, help='Path to camera calibration file for undistortion')
@@ -238,11 +237,9 @@ def main():
         enable_disk_cache=args.enable_disk_cache,
         cache_dir=args.cache_dir,
         rerun_port=args.rerun_port,
-        enable_sim3_optimization=not args.no_sim3_optimization,
         estimate_camera_params=args.estimate_camera_params,
         extract_keypoints=args.extract_keypoints,
         max_num_keypoints=args.max_num_keypoints,
-        keypoint_detection_threshold=args.keypoint_detection_threshold,
         create_chunk_reconstruction=args.create_chunk_reconstruction,
         save_chunk_reconstructions=args.save_chunk_reconstructions
     )
@@ -257,6 +254,13 @@ def main():
         
         slam.set_output_directory(output_dir)
         print(f"💾 Chunk reconstructions will be saved to: {os.path.join(output_dir, 'reconstructions')}")
+    
+    # Set reconstruction alignment parameters
+    slam.save_transformed_reconstructions = args.save_transformed_reconstructions
+    
+    print(f"🔧 Reconstruction alignment settings:")
+    print(f"   Save transformed PLY: {slam.save_transformed_reconstructions}")
+    print(f"   Save debug files: {slam.save_debug_reconstructions}")
     
     # Start background loader
     print("🔄 Starting background image loader...")

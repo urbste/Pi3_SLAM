@@ -156,6 +156,15 @@ class ChunkPTRecon:
             self.track_ids.extend(frame_track_ids)
         
         print(f"✅ Created reconstruction with {len(self.view_ids)} views and {len(self.track_ids)} tracks")
+
+        # Bundle adjust the reconstruction
+        ba_options = pt.sfm.BundleAdjustmentOptions()
+        ba_options.max_num_iterations = 5
+        ba_options.verbose = True
+        ba_options.robust_loss_width = 2.0
+        ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
+        ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
+
         return self.reconstruction
     
     def _project_points_to_other_cams(self, chunk_data: Dict, source_frame: int, target_frames: List[int]) -> List[np.ndarray]:
