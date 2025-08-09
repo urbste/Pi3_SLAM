@@ -412,6 +412,7 @@ def create_keypoint_extractor(keypoint_type: str = 'aliked', **kwargs) -> Option
     elif keypoint_type.lower() == 'grid':
         # Remove grid_spacing from kwargs if present (it's calculated automatically now)
         kwargs.pop('grid_spacing', None)
+        kwargs.pop('detection_threshold', None)
         return GridKeypointExtractor(**kwargs)
     elif keypoint_type.lower() == 'none':
         return None

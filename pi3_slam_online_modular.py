@@ -119,7 +119,7 @@ def main():
     # Input options
     input_group = parser.add_argument_group('📥 Input Options')
     input_group.add_argument('--image_dir', type=str, help='Directory containing images', 
-                        default='/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/')
+                        default='/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist/')
     input_group.add_argument('--video_path', type=str, help='Path to video file')
     input_group.add_argument('--start_frame', type=int, default=0, help='Starting frame for video')
     input_group.add_argument('--end_frame', type=int, default=None, help='Ending frame for video')
@@ -134,7 +134,7 @@ def main():
     proc_group = parser.add_argument_group('⚙️ Processing Options')
     proc_group.add_argument('--chunk_length', type=int, default=30, help='Number of frames per chunk')
     proc_group.add_argument('--overlap', type=int, default=5, help='Number of overlapping frames between chunks')
-    proc_group.add_argument('--conf_threshold', type=float, default=0.5, help='Confidence threshold for filtering points')
+    proc_group.add_argument('--conf_threshold', type=float,default=0.5, help='Confidence threshold for filtering points')
     proc_group.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
     
     # Camera parameter estimation options
@@ -146,7 +146,7 @@ def main():
     # Keypoint extraction options
     keypoint_group = parser.add_argument_group('🎯 Keypoint Extraction')
     keypoint_group.add_argument('--keypoint_type', default="grid", help='Type of keypoint extractor to use')
-    keypoint_group.add_argument('--max_num_keypoints', type=int, default=250, help='Maximum number of keypoints to extract per frame')
+    keypoint_group.add_argument('--max_num_keypoints', type=int, default=200, help='Maximum number of keypoints to extract per frame')
     keypoint_group.add_argument('--keypoint_detection_threshold', type=float, default=0.005, help='Detection threshold for keypoints')
     
     # Reconstruction options
@@ -159,7 +159,7 @@ def main():
                             help='Save debug files for all reconstruction stages')
     recon_group.add_argument('--save_debug_projections', action='store_true', default=False, 
                             help='Save debug projections as GIF files')
-    recon_group.add_argument('--max_observations_per_track', type=int, default=4, 
+    recon_group.add_argument('--max_observations_per_track', type=int, default=6, 
                             help='Maximum number of observations per track')
     recon_group.add_argument('--do_metric_depth', action='store_true', default=True, 
                             help='Use MoGe model to estimate metric depth')
@@ -262,7 +262,8 @@ def main():
         save_chunk_reconstructions=args.save_chunk_reconstructions,
         max_observations_per_track=args.max_observations_per_track,
         do_metric_depth=args.do_metric_depth,
-        save_debug_projections=args.save_debug_projections
+        save_debug_projections=args.save_debug_projections,
+        model_path=args.model_path,
     )
     
 
@@ -304,7 +305,8 @@ def main():
         # Process all chunks
         print("\n🔄 Starting SLAM processing...")
         print("=" * 60)
-        results = slam.process_chunks_with_background_loader(auto_close_visualization=not args.keep_viz_open)
+        # Use producer/consumer processing with background inference worker
+        results = slam.process_chunks_with_inference_worker(auto_close_visualization=not args.keep_viz_open)
         
         # Print final statistics
         print("\n" + "="*60)

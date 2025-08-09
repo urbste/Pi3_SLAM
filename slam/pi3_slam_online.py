@@ -30,6 +30,203 @@ from datasets.image_datasets import ChunkImageDataset
 from visualization.rerun_visualizer import visualization_process
 
 
+def _inference_worker(
+    input_queue: mp.Queue,
+    output_queue: mp.Queue,
+    model_path: str,
+    device: str,
+    do_metric_depth: bool,
+    conf_threshold: float,
+    target_size: Tuple[int, int],
+    estimate_camera_params: bool,
+    keypoint_type: str,
+    max_num_keypoints: int,
+    keypoint_detection_threshold: float,
+    async_debug: bool,
+):
+    """Background worker that runs Pi3 inference on incoming chunks and returns CPU results.
+
+    Expects items of the form:
+        {
+            'chunk_idx': int,
+            'start_idx': int,
+            'end_idx': int,
+            'chunk_images': torch.Tensor,  # shape (1, N, C, H, W)
+            'chunk_paths': List
+        }
+    Produces items of the form:
+        {
+            'chunk_idx': int,
+            'start_idx': int,
+            'end_idx': int,
+            'cpu_result': Dict[str, torch.Tensor]
+        }
+    """
+    import torch
+    import time
+    from pi3.models.pi3 import Pi3
+    from pi3.utils.geometry import depth_edge
+    from utils.keypoint_extraction import create_keypoint_extractor
+
+    # Initialize model inside the worker (safe with spawn)
+    model = Pi3.from_pretrained(model_path).to(device).eval()
+
+    moge_model = None
+    if do_metric_depth:
+        try:
+            from moge.model.v2 import MoGeModel
+            moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to("cuda").eval()
+        except Exception as e:
+            print(f"[Worker] ⚠️ Failed to initialize MoGe: {e}. Continuing without metric depth.")
+            moge_model = None
+
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    # Initialize keypoint extractor in worker (GPU-aware)
+    keypoint_extractor = None
+    try:
+        if keypoint_type and keypoint_type.lower() != 'none':
+            if keypoint_type.lower() == 'aliked':
+                keypoint_extractor = create_keypoint_extractor(
+                    'aliked',
+                    max_num_keypoints=max_num_keypoints,
+                    detection_threshold=keypoint_detection_threshold,
+                    device=device,
+                )
+            elif keypoint_type.lower() == 'grid':
+                keypoint_extractor = create_keypoint_extractor(
+                    'grid',
+                    max_num_keypoints=max_num_keypoints,
+                    device=device,
+                )
+    except Exception as e:
+        print(f"[Worker] ⚠️ Failed to initialize keypoint extractor ({keypoint_type}): {e}. Continuing without keypoints.")
+        keypoint_extractor = None
+
+    worker_t0 = time.time()
+    def _log(msg: str):
+        if async_debug:
+            dt = time.time() - worker_t0
+            print(f"[Worker +{dt:.3f}s] {msg}")
+
+    while True:
+        item = input_queue.get()
+        if item is None:
+            # Shutdown signal
+            break
+
+        try:
+            chunk_idx = int(item['chunk_idx'])
+            start_idx = int(item['start_idx'])
+            end_idx = int(item['end_idx'])
+            chunk_images = item['chunk_images']  # (1, N, C, H, W)
+            chunk_paths = item['chunk_paths']
+
+            _log(f"chunk {chunk_idx} dequeued; start inference frames {start_idx+1}-{end_idx}")
+            # Timings for this chunk
+            t_infer = 0.0
+            t_moge = 0.0
+            t_cam = 0.0
+            t_kp = 0.0
+            t_chunk0 = time.time()
+
+            with torch.no_grad():
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    _t_inf = time.time()
+                    result = model(chunk_images.to(device))
+            t_infer = time.time() - _t_inf
+            _log(f"chunk {chunk_idx} inference_done in {t_infer:.3f}s")
+
+            # Process masks
+            masks = torch.sigmoid(result['conf'][..., 0]) > 0.1
+            non_edge = ~depth_edge(result['local_points'][..., 2], rtol=0.03)
+            masks = torch.logical_and(masks, non_edge)[0]
+
+            # Optional metric depth scaling
+            if moge_model is not None:
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    _t_moge = time.time()
+                    moge_metric_depth = moge_model.infer(chunk_images[0, 0].to("cuda"))["depth"]
+                pi3_metric_depth = result['local_points'][0, 0][..., 2]
+                mask0 = masks[0]
+                scale_factor = (moge_metric_depth[mask0] / pi3_metric_depth[mask0]).median()
+                result["local_points"] = result["local_points"] * scale_factor
+                result["points"] = result["points"] * scale_factor
+                result["camera_poses"][:, :, :3, 3] = result["camera_poses"][:, :, :3, 3] * scale_factor
+                result["camera_poses_cw"] = torch.linalg.inv(result["camera_poses"])
+                t_moge = time.time() - _t_moge
+                _log(f"chunk {chunk_idx} moge_scaling_applied in {t_moge:.3f}s")
+
+            # Estimate camera parameters (optional). We keep it in the worker as requested "up to here".
+            camera_params = None
+            if estimate_camera_params:
+                from utils.camera_estimation import estimate_camera_parameters_single_chunk
+                _t_cam = time.time()
+                camera_params = estimate_camera_parameters_single_chunk(result)
+                t_cam = time.time() - _t_cam
+                _log(f"chunk {chunk_idx} camera_params_estimated in {t_cam:.3f}s")
+
+            # Move all results to CPU to save GPU memory
+            cpu_result = {
+                'points': result['points'][0].cpu(),
+                'local_points': result['local_points'][0].cpu(),
+                'camera_poses': result['camera_poses'][0].cpu(),
+                'conf': result['conf'][0].cpu(),
+                'masks': masks.cpu(),
+                'image_paths': chunk_paths,
+                'images': chunk_images.squeeze(0).cpu(),
+            }
+
+            if camera_params is not None:
+                cpu_result['camera_params'] = {k: v.cpu() for k, v in camera_params.items()}
+            # Pass through target size for reconstruction defaults
+            cpu_result['original_width'] = target_size[1]
+            cpu_result['original_height'] = target_size[0]
+
+            # Keypoint extraction (worker-side)
+            if keypoint_extractor is not None:
+                try:
+                    _t_kp = time.time()
+                    kp_res = keypoint_extractor.extract_with_colors(chunk_images)
+                    # Ensure CPU transfer
+                    cpu_result['keypoints'] = kp_res['keypoints'].cpu()
+                    cpu_result['descriptors'] = kp_res['descriptors'].cpu()
+                    cpu_result['scores'] = kp_res['scores'].cpu()
+                    cpu_result['colors'] = kp_res['colors'].cpu()
+                    t_kp = time.time() - _t_kp
+                    _log(f"chunk {chunk_idx} keypoints_extracted in {t_kp:.3f}s")
+                except Exception as e:
+                    print(f"[Worker] ⚠️ Keypoint extraction failed: {e}")
+
+            # Return payload
+            output_queue.put({
+                'chunk_idx': chunk_idx,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'cpu_result': cpu_result,
+                'timings': {
+                    'worker_inference_s': float(t_infer),
+                    'worker_moge_s': float(t_moge),
+                    'worker_camera_params_s': float(t_cam),
+                    'worker_keypoints_s': float(t_kp),
+                    'worker_total_s': float(time.time() - t_chunk0),
+                },
+            })
+            _log(f"chunk {chunk_idx} enqueued to out_q")
+
+            # Cleanup GPU tensors
+            del result
+
+        except Exception as e:
+            import traceback
+            print(f"[Worker] ❌ Error processing chunk {item.get('chunk_idx')}: {e}")
+            traceback.print_exc()
+            output_queue.put({
+                'chunk_idx': item.get('chunk_idx', -1),
+                'error': str(e),
+            })
+
+
 class Pi3SLAMOnline:
     """
     Pi3SLAM with online processing and visualization.
@@ -43,8 +240,9 @@ class Pi3SLAMOnline:
                  keypoint_type: str = 'aliked', max_num_keypoints: int = 512, 
                  keypoint_detection_threshold: float = 0.005,
                  save_chunk_reconstructions: bool = False,
-                 max_observations_per_track: int = 5, do_metric_depth: bool = False,
-                 save_debug_projections: bool = False):
+                  max_observations_per_track: int = 5, do_metric_depth: bool = False,
+                  save_debug_projections: bool = False,
+                  model_path: Optional[str] = None):
         """
         Initialize Pi3SLAM Online with visualization.
         
@@ -71,14 +269,17 @@ class Pi3SLAMOnline:
         self.conf_threshold = conf_threshold
         self.undistortion_maps = undistortion_maps
         self.cam_scale = cam_scale
-        self.pixel_limit = 255000
+        self.pixel_limit = 255000//2
         self.visualization_port = visualization_port
         self.estimate_camera_params = estimate_camera_params
         self.keypoint_type = keypoint_type.lower()
+        self.max_num_keypoints = max_num_keypoints
         self.save_chunk_reconstructions = save_chunk_reconstructions
         self.max_observations_per_track = max_observations_per_track
         self.do_metric_depth = do_metric_depth
         self.save_debug_projections = save_debug_projections
+        self.model_path = model_path
+        self.keypoint_detection_threshold = keypoint_detection_threshold
         # Initialize keypoint extractor if enabled
         self.keypoint_extractor = None
         if self.keypoint_type != 'none':
@@ -147,6 +348,17 @@ class Pi3SLAMOnline:
         self.loader_process = None
         self.loader_queue = None
         self.target_size = None
+        # Inference worker
+        self.infer_ctx = None
+        self.infer_process = None
+        self.infer_in_q = None
+        self.infer_out_q = None
+        # Async processing counters
+        self._async_produced = 0
+        self._async_consumed = 0
+        self._async_pending_ready = 0
+        # Buffer for out-of-order items to preserve strict in-order consumption
+        self._async_future_outputs: Dict[int, Dict] = {}
         
         # MoGe model
         self.moge_model = None
@@ -160,6 +372,58 @@ class Pi3SLAMOnline:
         print(f"   Camera scale: {cam_scale}")
         if undistortion_maps:
             print(f"   Undistortion: Enabled")
+
+    def start_inference_worker(self, async_debug: bool = False):
+        """Start background Pi3 inference worker process."""
+        if self.infer_process is not None:
+            return
+        if self.model_path is None:
+            raise ValueError("model_path must be provided to use the inference worker (spawned process).")
+        if self.target_size is None:
+            raise ValueError("target_size is not set; start the background loader first to compute it.")
+
+        # Use spawn context to be CUDA-safe
+        self.infer_ctx = mp.get_context("spawn")
+        self.infer_in_q = self.infer_ctx.Queue(maxsize=2)
+        self.infer_out_q = self.infer_ctx.Queue(maxsize=10)
+        self.infer_process = self.infer_ctx.Process(
+            target=_inference_worker,
+            args=(
+                self.infer_in_q,
+                self.infer_out_q,
+                self.model_path,
+                self.device,
+                self.do_metric_depth,
+                self.conf_threshold,
+                self.target_size,
+                self.estimate_camera_params,
+                self.keypoint_type,
+                self.max_num_keypoints,
+                self.keypoint_detection_threshold,
+                async_debug,
+            ),
+        )
+        self.infer_process.start()
+        print("🧵 Background inference worker started")
+
+    def stop_inference_worker(self):
+        """Stop background Pi3 inference worker process."""
+        if self.infer_process is None:
+            return
+        try:
+            # Signal shutdown
+            if self.infer_in_q is not None:
+                self.infer_in_q.put(None)
+            self.infer_process.join(timeout=5.0)
+            if self.infer_process.is_alive():
+                self.infer_process.terminate()
+                self.infer_process.join(timeout=2.0)
+        finally:
+            self.infer_process = None
+            self.infer_in_q = None
+            self.infer_out_q = None
+            self.infer_ctx = None
+            print("🧵 Background inference worker stopped")
     
     def _extract_points_colors_from_reconstructions(self, latest_only: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """Collect 3D points and colors from PyTheia reconstructions.
@@ -408,15 +672,15 @@ class Pi3SLAMOnline:
                 end_idx = chunk_data['end_idx'].item()
                 chunk_images = chunk_data['chunk']
                 chunk_paths = chunk_data['chunk_paths'][0]
-                
+
                 print(f"\n📦 Processing chunk {chunk_count}/{total_chunks}: frames {start_idx + 1}-{end_idx}")
-                
+
                 # Process chunk directly with loaded images
                 _t0 = time.time()
                 result = self._process_chunk_with_images(chunk_images, chunk_paths)
                 self._record_timing("process_chunk", time.time() - _t0)
                 results.append(result)
-                
+
                 # Small delay to allow visualization to update
                 if self.vis_running:
                     time.sleep(0.1)
@@ -441,6 +705,317 @@ class Pi3SLAMOnline:
         avg_fps = frames_processed / elapsed_total
         print(f"\n⏱️ Overall performance: {frames_processed} frames in {elapsed_total:.2f}s  ->  average {avg_fps:.2f} FPS")
         return results
+
+    def process_chunks_with_inference_worker(self, auto_close_visualization: bool = True) -> List[Dict]:
+        """Process chunks by offloading Pi3 inference to a background process and reconstructing in the main process.
+
+        This preserves the existing pipeline while overlapping GPU inference with CPU reconstruction/alignment.
+        """
+        if not self.loader_running or self.background_loader is None:
+            raise ValueError("Background loader not started")
+
+        # Ensure inference worker is running
+        self.start_inference_worker(async_debug=True)
+
+        results: List[Dict] = []
+        total_chunks = len(self.background_loader.dataset)
+        print(f"\n🔄 Starting async chunk-based processing with {total_chunks} chunks...")
+        print("=" * 60)
+
+        next_chunk_idx_to_process = 0
+        pending_outputs: Dict[int, Dict] = {}
+        produced = 0
+        consumed = 0
+        processing_start_time = time.time()
+        frames_before = len(self.timestamps)
+
+        try:
+            # Iterate dataset and feed the worker; eagerly consume in-order outputs
+            for chunk_data in self.background_loader:
+                start_idx = int(chunk_data['start_idx'].item())
+                end_idx = int(chunk_data['end_idx'].item())
+                chunk_images = chunk_data['chunk']
+                chunk_paths = chunk_data['chunk_paths'][0]
+
+                print(f"\n📦 Queuing chunk {produced + 1}/{total_chunks}: frames {start_idx + 1}-{end_idx}")
+                self.get_queue_status()
+
+                # Enqueue next chunk (non-blocking)
+                enqueued = False
+                while not enqueued:
+                    try:
+                        self.infer_in_q.put_nowait({
+                            'chunk_idx': produced,
+                            'start_idx': start_idx,
+                            'end_idx': end_idx,
+                            'chunk_images': chunk_images,
+                            'chunk_paths': chunk_paths,
+                        })
+                        enqueued = True
+                        produced += 1
+                        self._async_produced = produced
+                    except mp.queues.Full:
+                        # Input queue full: blockingly drain one or more outputs and process in-order
+                        self._drain_inference_outputs(pending_outputs, block=True)
+                        consumed += self._process_ready_outputs_in_order(pending_outputs, next_chunk_idx_to_process, results)
+                        next_chunk_idx_to_process = consumed
+
+                # After enqueueing, block briefly to eagerly consume any ready in-order output
+                self._drain_inference_outputs(pending_outputs, block=True)
+                consumed += self._process_ready_outputs_in_order(pending_outputs, next_chunk_idx_to_process, results)
+                next_chunk_idx_to_process = consumed
+                self._async_consumed = consumed
+                self.get_queue_status()
+
+            # All inputs queued; now drain remaining outputs (blocking until all consumed)
+            while consumed < produced:
+                self._drain_inference_outputs(pending_outputs, block=True)
+                consumed += self._process_ready_outputs_in_order(pending_outputs, next_chunk_idx_to_process, results)
+                next_chunk_idx_to_process = consumed
+                self._async_consumed = consumed
+
+        except KeyboardInterrupt:
+            print(f"\n⚠️  Processing interrupted by user")
+        except Exception as e:
+            print(f"\n❌ Error during async processing: {e}")
+            raise
+        finally:
+            # Ensure worker is stopped
+            self.stop_inference_worker()
+
+        # Close visualization optionally
+        if auto_close_visualization:
+            self.stop_visualization()
+
+        # Print timing and FPS
+        self.print_timing_statistics()
+        elapsed_total = max(1e-6, time.time() - processing_start_time)
+        frames_after = len(self.timestamps)
+        frames_processed = max(0, frames_after - frames_before)
+        avg_fps = frames_processed / elapsed_total
+        print(f"\n⏱️ Overall performance: {frames_processed} frames in {elapsed_total:.2f}s  ->  average {avg_fps:.2f} FPS")
+
+        return results
+
+    def _drain_inference_outputs(self, pending_outputs: Dict[int, Dict], block: bool = False) -> None:
+        """Pull available items from the inference output queue into a pending buffer keyed by chunk_idx."""
+        if self.infer_out_q is None:
+            return
+        # First, if the next expected chunk is already buffered out-of-order, promote it
+        expected_idx = self._async_consumed
+        if expected_idx in self._async_future_outputs and expected_idx not in pending_outputs:
+            item = self._async_future_outputs.pop(expected_idx)
+            pending_outputs[expected_idx] = item
+            self._async_pending_ready = len(pending_outputs)
+            t = item.get('timings') or {}
+            infer_s = (t or {}).get('worker_inference_s')
+            total_s = (t or {}).get('worker_total_s')
+            if infer_s is not None and total_s is not None:
+                print(f"✅ Ready (buffered): chunk {expected_idx} (pending_ready={self._async_pending_ready}) | worker_infer={infer_s:.3f}s total={total_s:.3f}s")
+            else:
+                print(f"✅ Ready (buffered): chunk {expected_idx} (pending_ready={self._async_pending_ready})")
+            return
+        while True:
+            try:
+                item = self.infer_out_q.get(timeout=0.1 if block else 0.0)
+            except Exception:
+                break
+            if item is None:
+                break
+            if 'error' in item:
+                print(f"❌ Inference worker error on chunk {item.get('chunk_idx')}: {item['error']}")
+                continue
+            idx = int(item['chunk_idx'])
+            expected_idx = self._async_consumed
+            if idx == expected_idx:
+                pending_outputs[idx] = item
+            else:
+                # Store out-of-order item in a side buffer; do not requeue
+                self._async_future_outputs[idx] = item
+            # Track number of pending ready items
+            try:
+                self._async_pending_ready = len(pending_outputs)
+            except Exception:
+                pass
+            # Debug: show which chunk became ready
+            t = item.get('timings') or {}
+            infer_s = t.get('worker_inference_s')
+            total_s = t.get('worker_total_s')
+            if idx == expected_idx:
+                if infer_s is not None and total_s is not None:
+                    print(f"✅ Ready: chunk {idx} (pending_ready={self._async_pending_ready}) | worker_infer={infer_s:.3f}s total={total_s:.3f}s")
+                else:
+                    print(f"✅ Ready: chunk {idx} (pending_ready={self._async_pending_ready})")
+
+    def _process_ready_outputs_in_order(self, pending_outputs: Dict[int, Dict], next_idx: int, results: List[Dict]) -> int:
+        """Process consecutive ready outputs starting from next_idx. Returns how many were consumed."""
+        consumed_here = 0
+        while next_idx in pending_outputs:
+            item = pending_outputs.pop(next_idx)
+
+            # Compose and run the rest of the pipeline on cpu_result
+            print(f"🚧 Consuming chunk {next_idx} -> reconstruction/alignment...")
+            out = self._consume_cpu_result(item['cpu_result'], item['start_idx'], item['end_idx'])
+            results.append(out)
+            consumed_here += 1
+            next_idx += 1
+        # Update count after consuming
+        try:
+            self._async_pending_ready = len(pending_outputs)
+        except Exception:
+            pass
+        #print(f"📉 Post-consume: pending_ready={self._async_pending_ready}")
+        return consumed_here
+
+    def get_queue_status(self) -> Dict[str, Optional[int]]:
+        """Return a snapshot of async queue status.
+
+        available_for_consumer = in-memory pending ready + items in the out-queue.
+        Some platforms do not support qsize(); in that case values may be None.
+        """
+        in_q = self.infer_in_q
+        out_q = self.infer_out_q
+        try:
+            in_qsize = in_q.qsize() if in_q is not None else 0
+        except Exception:
+            in_qsize = None
+        try:
+            out_qsize = out_q.qsize() if out_q is not None else 0
+        except Exception:
+            out_qsize = None
+
+        if out_qsize is None:
+            available = None
+        else:
+            available = (self._async_pending_ready or 0) + out_qsize
+
+        status = {
+            'produced_chunks': self._async_produced,
+            'consumed_chunks': self._async_consumed,
+            'inflight_chunks': max(0, self._async_produced - self._async_consumed),
+            'in_queue_size': in_qsize,
+            'out_queue_size': out_qsize,
+            'pending_ready': self._async_pending_ready,
+            'available_for_consumer': available,
+        }
+        print(f"📊 Queue status: {status}")
+        return status
+
+    def _consume_cpu_result(self, cpu_result: Dict, start_idx: int, end_idx: int) -> Dict:
+        """Run keypoint extraction, interpolation, reconstruction, alignment, visualization on a CPU result dict."""
+        # Update timestamps from image paths
+        actual_paths = []
+        for path_item in cpu_result['image_paths']:
+            if isinstance(path_item, list):
+                actual_paths.extend(path_item)
+            else:
+                actual_paths.append(path_item)
+        chunk_timestamps = extract_timestamps_from_paths(actual_paths)
+        self.timestamps.extend(chunk_timestamps)
+
+        chunk_images = cpu_result['images'] if isinstance(cpu_result['images'], torch.Tensor) else torch.as_tensor(cpu_result['images'])
+
+        # Keypoint extraction (prefer worker-provided)
+        if 'keypoints' in cpu_result and 'colors' in cpu_result and cpu_result['keypoints'] is not None:
+            keypoint_results = {
+                'keypoints': cpu_result['keypoints'],
+                'descriptors': cpu_result.get('descriptors', None),
+                'scores': cpu_result.get('scores', None),
+                'colors': cpu_result['colors'],
+            }
+            print(f"🔍 Using worker-provided keypoints: {keypoint_results['keypoints'].shape[-2]} per frame")
+        else:
+            _t0_kp = time.time()
+            keypoint_results = self.keypoint_extractor.extract_with_colors(chunk_images)
+            self._record_timing("keypoint_extraction", time.time() - _t0_kp)
+            print(f"🔍 Extracted {keypoint_results['keypoints'].shape[-2]} keypoints per frame")
+
+        # Add camera parameters if estimated
+        if 'camera_params' in cpu_result and cpu_result['camera_params'] is not None:
+            cpu_result['camera_params'] = {k: v.cpu() for k, v in cpu_result['camera_params'].items()}
+
+        # Interpolate 3D points for each keypoint
+        _t0_interp = time.time()
+        res = self.interpolate_world_points_for_ref(cpu_result, keypoint_results['keypoints'])
+        dt_interp = time.time() - _t0_interp
+        self._record_timing("interpolate_points", dt_interp)
+        print(f"⏱️ Interpolation: {dt_interp:.3f}s")
+
+        cpu_result['points'] = res['points']
+        cpu_result['local_points'] = res['local_points']
+        cpu_result['conf'] = res['conf']
+        cpu_result['masks'] = res['masks']
+        cpu_result['keypoints'] = keypoint_results['keypoints'].cpu()
+        if keypoint_results.get('descriptors') is not None:
+            cpu_result['descriptors'] = keypoint_results['descriptors'].cpu()
+        if keypoint_results.get('scores') is not None:
+            cpu_result['scores'] = keypoint_results['scores'].cpu()
+        cpu_result['colors'] = keypoint_results['colors'].cpu()
+
+        # Set target size for reconstruction
+        self.chunk_reconstructor.set_target_size(self.target_size[1], self.target_size[0])
+        # Add camera intrinsics if available
+        if 'camera_params' in cpu_result and cpu_result['camera_params'] is not None:
+            cpu_result['intrinsics'] = cpu_result['camera_params']['intrinsics']
+
+        # Create reconstruction
+        _t0_recon = time.time()
+        chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(
+            cpu_result, max_observations_per_track=self.max_observations_per_track
+        )
+        dt_recon = time.time() - _t0_recon
+        self._record_timing("create_reconstruction", dt_recon)
+        print(f"⏱️ Reconstruction: {dt_recon:.3f}s")
+
+        if self.save_debug_projections:
+            if hasattr(self, 'output_dir') and self.output_dir:
+                debug_gif_dir = os.path.join(self.output_dir, 'debug_projections')
+                os.makedirs(debug_gif_dir, exist_ok=True)
+                gif_filename = f"chunk_{len(self.chunk_reconstructions):03d}_projections.gif"
+                gif_path = os.path.join(debug_gif_dir, gif_filename)
+            else:
+                gif_path = f"chunk_{len(self.chunk_reconstructions):03d}_projections.gif"
+            self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], save_path=gif_path, fps=1)
+            self.chunk_reconstructor.print_reconstruction_summary()
+
+        # Store reconstruction
+        self.chunk_reconstructions.append(chunk_reconstruction)
+        if self.save_chunk_reconstructions:
+            self._save_chunk_reconstruction(chunk_reconstruction, len(self.chunk_reconstructions))
+
+        # Generate camera IDs for this chunk
+        chunk_idx = len(self.chunk_reconstructions)
+        start_frame = chunk_idx * (self.chunk_length - self.overlap)
+        chunk_camera_ids = list(range(start_frame + 1, start_frame + len(cpu_result['image_paths']) + 1))
+
+        # Track current chunk for frame display
+        self.current_chunk_result = cpu_result
+
+        # Align with previous chunks
+        _t0_align = time.time()
+        aligned_chunk = self._align_chunk_online(cpu_result, chunk_camera_ids)
+        dt_align = time.time() - _t0_align
+        self._record_timing("align_chunk", dt_align)
+        print(f"⏱️ Alignment: {dt_align:.3f}s")
+
+        # Update visualization
+        if self.vis_running:
+            _t0_viz = time.time()
+            self._update_visualization(aligned_chunk)
+            self._record_timing("update_visualization", time.time() - _t0_viz)
+
+        # Print progress
+        print(f"📊 Chunk {len(self.chunk_reconstructions)}: {len(cpu_result['image_paths'])} frames processed")
+        all_points, _ = self._extract_points_colors_from_reconstructions(latest_only=False)
+        total_points = len(all_points) if all_points.size > 0 else 0
+        print(f"   Total points: {total_points}")
+
+        return {
+            'chunk_result': cpu_result,
+            'aligned_chunk': aligned_chunk,
+            'camera_ids': chunk_camera_ids,
+            'timestamps': chunk_timestamps,
+        }
 
     def interpolate_world_points_for_ref(self, result, keypoints):
         # interpolate like the colors for keypoints
@@ -875,8 +1450,6 @@ class Pi3SLAMOnline:
                 camera_positions = aligned_chunk_data['camera_poses']
                 camera_orientations = aligned_chunk_data.get('camera_orientations', np.array([]))
             else:
-                # Fall back to reconstruction-only visualization - only get latest reconstruction data
-                # since all previous data was already sent to rerun before
                 all_points, all_colors = self._get_visualization_points()
                 camera_positions, camera_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
             
@@ -958,7 +1531,6 @@ class Pi3SLAMOnline:
     
     def _get_visualization_points(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get subsampled points for visualization from PyTheia reconstructions only."""
-        # Only get points from the latest reconstruction since all previous data was already sent to rerun
         combined_points, combined_colors = self._extract_points_colors_from_reconstructions(latest_only=True)
         if combined_points.size == 0:
             return np.array([]), np.array([])

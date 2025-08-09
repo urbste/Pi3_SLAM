@@ -88,8 +88,8 @@ def align_and_refine_reconstructions(recon_ref: pt.sfm.Reconstruction,
         options = pt.sfm.Sim3AlignmentOptions()
         options.alignment_type = pt.sfm.Sim3AlignmentType.POINT_TO_POINT
         options.max_iterations = 5
-        options.huber_threshold = 0.5
-        options.perform_optimization = True
+        options.huber_threshold = 1.0
+        options.perform_optimization = False
         options.verbose = False
 
         # Run Sim3 optimization

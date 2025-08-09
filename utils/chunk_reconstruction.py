@@ -7,9 +7,6 @@ import numpy as np
 from typing import Dict, List, Optional
 import pytheia as pt
 from pi3.utils.camera import Camera
-import cv2
-import os
-from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
@@ -28,15 +25,6 @@ class ChunkPTRecon:
         self.view_ids = []
         self.track_ids = []
 
-
-    # Get scale factor from first image using global MoGe model
-    def _get_scale_factor_for_pi3(self, moge_metric_depth, pi3_metric_depth, mask):
-        moge_metric_depth = moge_metric_depth[mask]
-        pi3_metric_depth = pi3_metric_depth[mask]
-        scale_factor = moge_metric_depth / pi3_metric_depth
-        scale_factor = scale_factor.median()
-        return scale_factor
-    
     def set_target_size(self, original_width: int, original_height: int):
         """
         Set the target size for the reconstruction.
@@ -80,18 +68,6 @@ class ChunkPTRecon:
         else:
             num_frames = chunk_data['camera_poses'].shape[0]
             print(f"🔧 Creating PyTheia reconstruction from chunk: {num_frames} frames, no keypoints available")
-        
-        print(f"   Max observations per track: {max_observations_per_track}")
-
-        # Debug: show view names being added
-        if 'image_paths' in chunk_data and chunk_data['image_paths']:
-            for i, path in enumerate(chunk_data['image_paths'][:3]):  # Show first 3
-                if isinstance(path, list):
-                    path = path[0] if path else f"frame_{i}"
-                import os
-                print(f"   Frame {i}: {os.path.basename(path)}")
-            if len(chunk_data['image_paths']) > 3:
-                print(f"   ... and {len(chunk_data['image_paths']) - 3} more frames")
 
         # Add cameras to reconstruction
         for frame_idx in range(num_frames):
@@ -145,73 +121,66 @@ class ChunkPTRecon:
         # Set camera intrinsics from priors
         pt.sfm.SetCameraIntrinsicsFromPriors(self.reconstruction)
         
-        # Add tracks for each frame (only if keypoints are available)
-        for frame_idx in range(num_frames):
-            # Get 3D points and colors for this frame
-            points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
-            colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
-            keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
-            masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
-            #descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
+        # Add tracks and observations only if keypoints are available
+        if has_keypoints:
+            for frame_idx in range(num_frames):
+                # Get 3D points and colors for this frame
+                points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
+                colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
+                keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
+                masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
+                #descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
 
-            # Create tracks for this frame
-            frame_track_ids = []
-            
-            for kp_idx in range(keypoints_2d.shape[0]):
+                # Create tracks for this frame
+                frame_track_ids = []
                 
-                # Create track
-                track_id = self.reconstruction.AddTrack()
-                track = self.reconstruction.MutableTrack(track_id)
+                for kp_idx in range(keypoints_2d.shape[0]):
+                    
+                    # Create track
+                    track_id = self.reconstruction.AddTrack()
+                    track = self.reconstruction.MutableTrack(track_id)
+                    
+                    # Set 3D point (homogeneous)
+                    track.SetPoint(np.hstack([points_3d[kp_idx], 1]))
+                    
+                    # Set color
+                    track.SetColor(colors[kp_idx])
+                    track.SetIsEstimated(True)
+                    #track.SetReferenceDescriptor(descriptors[kp_idx])
+                    
+                    frame_track_ids.append(track_id)
+                    
+                    # Add observation for this frame
+                    self.reconstruction.AddObservation(
+                        self.view_ids[frame_idx], 
+                        track_id, 
+                        pt.sfm.Feature(keypoints_2d[kp_idx])
+                    )
                 
-                # Set 3D point
-                # make point homogeneous
-                track.SetPoint(np.hstack([points_3d[kp_idx], 1]))
-                
-                # Set color
-                track.SetColor(colors[kp_idx])
-                track.SetIsEstimated(True)
-                #track.SetReferenceDescriptor(descriptors[kp_idx])
-                
-                frame_track_ids.append(track_id)
-                
-                # Add observation for this frame
-                self.reconstruction.AddObservation(
-                    self.view_ids[frame_idx], 
-                    track_id, 
-                    pt.sfm.Feature(keypoints_2d[kp_idx])
+                # Project keypoints to subset of other frames
+                all_frames = [i for i in range(num_frames)]
+                frame_idx_index = all_frames.index(frame_idx)
+                all_frames_before = all_frames[:frame_idx_index]
+                all_frames_after = all_frames[frame_idx_index + 1 : frame_idx_index + max_observations_per_track // 2 + 1]
+                all_frames = all_frames_before + all_frames_after
+
+                # Project points to all other frames
+                projected_points = self._project_points_to_other_cams(
+                    chunk_data, frame_idx, all_frames
                 )
-            
-            # Project keypoints to ALL other frames in the chunk
-            # create an option to only project to subset of frames
-            all_frames = [i for i in range(num_frames)]
-            # find frame_idx index in all_frames
-            frame_idx_index = all_frames.index(frame_idx)
-            # now take max_observations_per_track // 2 before and after frame_idx
-            all_frames_before = all_frames[:frame_idx_index]
-            all_frames_after = all_frames[frame_idx_index + 1 : frame_idx_index + max_observations_per_track // 2 + 1]
-            all_frames = all_frames_before + all_frames_after
-
-            # Project points to all other frames
-            projected_points = self._project_points_to_other_cams(
-                chunk_data, frame_idx, all_frames
-            )
-            
-            # Add observations for projected points (with limit per track)
-            for other_frame_idx, projected_kps in zip(all_frames, projected_points):
-                for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
-                    # Check if projected point is within image bounds
-                    if (0 <= projected_pt[0] < self.original_width and 
-                        0 <= projected_pt[1] < self.original_height):
-                        
-                        # Check current number of observations for this track
-                        track = self.reconstruction.MutableTrack(track_id)
-                        
-                        # Only add observation if we haven't reached the limit
-                        self.reconstruction.AddObservation(
-                            self.view_ids[other_frame_idx],
-                            track_id,
-                            pt.sfm.Feature(projected_pt)
-                        )
+                
+                # Add observations for projected points (with limit per track)
+                for other_frame_idx, projected_kps in zip(all_frames, projected_points):
+                    for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
+                        # Check if projected point is within image bounds
+                        if (0 <= projected_pt[0] < self.original_width and 
+                            0 <= projected_pt[1] < self.original_height):
+                            # Only add observation if we haven't reached the limit
+                            self.reconstruction.AddObservation(
+                                self.view_ids[other_frame_idx],
+                                track_id,
+                                pt.sfm.Feature(projected_pt)
+                            )
 
     
         print(f"✅ Created reconstruction with {len(self.reconstruction.ViewIds())} views and {len(self.reconstruction.TrackIds())} tracks")
@@ -223,7 +192,8 @@ class ChunkPTRecon:
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
         ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
 
-        removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)
+        removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(
+            set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)
         print(f"   Removed {removed_tracks} tracks after initial bundle adjustment")
 
         return self.reconstruction
