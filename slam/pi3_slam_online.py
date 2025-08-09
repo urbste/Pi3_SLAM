@@ -15,40 +15,54 @@ from pi3.utils.basic import write_ply
 from pi3.utils.geometry import depth_edge
 
 # Import our modular components
-from utils.geometry_utils import apply_transformation_to_points, apply_transformation_to_poses, verify_coordinate_system
-from utils.image_utils import calculate_target_size, load_images_from_paths, extract_colors_from_chunk
+from utils.image_utils import calculate_target_size
 from utils.timestamp_utils import extract_timestamps_from_paths
 from utils.camera_estimation import estimate_camera_parameters_single_chunk, print_camera_parameters_summary
-from utils.keypoint_extraction import ALIKEDExtractor
+from utils.keypoint_extraction import create_keypoint_extractor
 from utils.chunk_reconstruction import ChunkPTRecon
 from utils.reconstruction_alignment import (
     create_view_graph_matches, 
-    align_reconstructions_sim3,
     align_and_refine_reconstructions
 )
+from utils.telemetry_converter import TelemetryImporter
 import pytheia as pt
-from alignment.correspondence import find_corresponding_points
 from datasets.image_datasets import ChunkImageDataset
 from visualization.rerun_visualizer import visualization_process
-import cv2
 
 
-class Pi3SLAMOnlineRerun:
+class Pi3SLAMOnline:
     """
-    Pi3SLAM with online processing and Rerun visualization.
+    Pi3SLAM with online processing and visualization.
     Processes long sequences in chunks with real-time visualization.
     """
     
     def __init__(self, model: Pi3, chunk_length: int = 100, overlap: int = 10, 
                  device: str = 'cuda', conf_threshold: float = 0.5, 
-                 undistortion_maps=None, cam_scale: float = 1.0,
-                 max_chunks_in_memory: int = 5, enable_disk_cache: bool = False,
-                 cache_dir: str = None, rerun_port: int = 9090, 
-                 estimate_camera_params: bool = False, extract_keypoints: bool = False,
-                 max_num_keypoints: int = 512, keypoint_detection_threshold: float = 0.005,
-                 create_chunk_reconstruction: bool = False, save_chunk_reconstructions: bool = False):
+                 undistortion_maps=None, cam_scale: float = 1.0, visualization_port: int = 9090, 
+                 estimate_camera_params: bool = False, 
+                 keypoint_type: str = 'aliked', max_num_keypoints: int = 512, 
+                 keypoint_detection_threshold: float = 0.005,
+                 save_chunk_reconstructions: bool = False,
+                 max_observations_per_track: int = 5, do_metric_depth: bool = False,
+                 save_debug_projections: bool = False):
         """
-        Initialize Pi3SLAM Online with Rerun visualization.
+        Initialize Pi3SLAM Online with visualization.
+        
+        Args:
+            model: Pi3 model instance
+            chunk_length: Number of frames per chunk
+            overlap: Number of overlapping frames between chunks
+            device: Device to run on ('cuda' or 'cpu')
+            conf_threshold: Confidence threshold for point filtering
+            undistortion_maps: Undistortion maps for camera calibration
+            cam_scale: Camera scale factor
+            visualization_port: Port for visualization
+            estimate_camera_params: Whether to estimate camera parameters
+            keypoint_type: Type of keypoint extraction ('aliked', 'grid', or 'none')
+            max_num_keypoints: Maximum number of keypoints to extract
+            keypoint_detection_threshold: Detection threshold for ALIKED keypoints
+            save_chunk_reconstructions: Whether to save chunk reconstructions to disk
+            max_observations_per_track: Maximum observations per track
         """
         self.model = model
         self.chunk_length = chunk_length
@@ -57,64 +71,53 @@ class Pi3SLAMOnlineRerun:
         self.conf_threshold = conf_threshold
         self.undistortion_maps = undistortion_maps
         self.cam_scale = cam_scale
-        self.max_chunks_in_memory = max_chunks_in_memory
-        self.enable_disk_cache = enable_disk_cache
-        self.cache_dir = cache_dir
         self.pixel_limit = 255000
-        self.memory_monitoring = True
-        self.rerun_port = rerun_port
+        self.visualization_port = visualization_port
         self.estimate_camera_params = estimate_camera_params
-        self.extract_keypoints = extract_keypoints
-        self.create_chunk_reconstruction = create_chunk_reconstruction
+        self.keypoint_type = keypoint_type.lower()
         self.save_chunk_reconstructions = save_chunk_reconstructions
-        
+        self.max_observations_per_track = max_observations_per_track
+        self.do_metric_depth = do_metric_depth
+        self.save_debug_projections = save_debug_projections
         # Initialize keypoint extractor if enabled
         self.keypoint_extractor = None
-        if self.extract_keypoints:
+        if self.keypoint_type != 'none':
             try:
-                self.keypoint_extractor = ALIKEDExtractor(
-                    max_num_keypoints=max_num_keypoints,
-                    detection_threshold=keypoint_detection_threshold,
-                    device=device
-                )
-                print(f"🔍 ALIKED keypoint extractor initialized with {max_num_keypoints} max keypoints")
-            except ImportError:
-                print("⚠️  Warning: lightglue not available, keypoint extraction disabled")
-                self.extract_keypoints = False
+                if self.keypoint_type == 'aliked':
+                    self.keypoint_extractor = create_keypoint_extractor(
+                        keypoint_type='aliked',
+                        max_num_keypoints=max_num_keypoints,
+                        detection_threshold=keypoint_detection_threshold,
+                        device=device
+                    )
+                    print(f"🔍 ALIKED keypoint extractor initialized with {max_num_keypoints} max keypoints")
+                elif self.keypoint_type == 'grid':
+                    self.keypoint_extractor = create_keypoint_extractor(
+                        keypoint_type='grid',
+                        max_num_keypoints=max_num_keypoints,
+                        device=device
+                    )
+                    print(f"🔍 Grid-based keypoint extractor initialized with {max_num_keypoints} max keypoints (spacing calculated automatically)")
+                else:
+                    print(f"⚠️  Unknown keypoint type: {keypoint_type}, disabling keypoint extraction")
+                    self.keypoint_type = 'none'
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to initialize keypoint extractor ({keypoint_type}): {e}")
+                print("   Continuing without keypoint extraction...")
+                self.keypoint_type = 'none'
+                self.keypoint_extractor = None
+        else:
+            print("🔍 Keypoint extraction disabled")
         
         # Initialize chunk reconstruction if enabled
-        self.chunk_reconstructor = None
-        if self.create_chunk_reconstruction:
-            try:
-                self.chunk_reconstructor = ChunkPTRecon()
-                print(f"🔧 ChunkPTRecon initialized ")
-            except ImportError:
-                print("⚠️  Warning: pytheia not available, chunk reconstruction disabled")
-                self.create_chunk_reconstruction = False
-        
-        # Initialize data structures
-        self.chunk_results = []
-        self.camera_ids = []
-        self.aligned_points = []
-        self.aligned_camera_poses = []
-        self.aligned_camera_ids = []
-        self.aligned_colors = []
+        self.chunk_reconstructor = ChunkPTRecon()
         
         # Pytheia reconstructions storage (in-memory)
         self.chunk_reconstructions = []
         
         # Reconstruction alignment settings
-        self.use_reconstruction_alignment = True
-        self.feature_match_threshold = 5.0  # pixels
-        self.descriptor_match_threshold = 0.8  # normalized distance
-        self.min_common_tracks = 10  # minimum tracks needed for alignment
-        self.use_reconstruction_refinement = True  # Enable full refinement pipeline
         self.save_transformed_reconstructions = False  # Save PLY files of transformed reconstructions
-        self.save_debug_reconstructions = True  # Save debug files for all reconstruction stages
-        
-        # Keypoint data structures for visualization
-        self.aligned_keypoint_points = None
-        self.aligned_keypoint_colors = None
+        self.save_debug_reconstructions = False  # Save debug files for all reconstruction stages
         
         # Camera trajectory tracking
         self.full_camera_trajectory = []
@@ -125,7 +128,7 @@ class Pi3SLAMOnlineRerun:
         self.timestamps = []
         
         # Configuration for correspondence search
-        self.correspondence_subsample_factor = 1 if self.extract_keypoints else 10
+        self.correspondence_subsample_factor = 1 if self.keypoint_type != 'none' else 10
         
         # Visualization
         self.vis_running = False
@@ -136,34 +139,167 @@ class Pi3SLAMOnlineRerun:
         self.update_interval = 0.1
         self.visualization_subsample_ratio = 0.1
         
+        # Timing statistics
+        self.timing_stats: Dict[str, Dict[str, float]] = {}
+
         # Background loading
         self.loader_running = False
         self.loader_process = None
         self.loader_queue = None
-        self.image_cache = {}
         self.target_size = None
         
-        # Disk cache
-        self.disk_cache = {}
-        if self.enable_disk_cache:
-            self._setup_disk_cache()
-        
+        # MoGe model
+        self.moge_model = None
+        if self.do_metric_depth:
+            print("   Loading MoGe model...")
+            from moge.model.v2 import MoGeModel
+            self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to("cuda").eval()
+
         print(f"🚀 Pi3SLAM Online initialized with chunk_length={chunk_length}, overlap={overlap}")
         print(f"   Device: {device}, Confidence threshold: {conf_threshold}")
         print(f"   Camera scale: {cam_scale}")
         if undistortion_maps:
             print(f"   Undistortion: Enabled")
-        if enable_disk_cache:
-            print(f"   Disk cache: Enabled ({cache_dir or 'Temporary'})")
-        print(f"   Max chunks in memory: {max_chunks_in_memory}")
     
-    def _setup_disk_cache(self):
-        """Set up disk cache if enabled."""
-        if self.cache_dir is None:
-            import tempfile
-            self.cache_dir = tempfile.mkdtemp(prefix="pi3slam_cache_")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        print(f"💾 Disk caching enabled: {self.cache_dir}")
+    def _extract_points_colors_from_reconstructions(self, latest_only: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect 3D points and colors from PyTheia reconstructions.
+        
+        Args:
+            latest_only: If True, only extract from the latest reconstruction. If False, extract from all reconstructions.
+        """
+        if not self.chunk_reconstructions:
+            return np.array([]), np.array([])
+
+        all_points: List[np.ndarray] = []
+        all_colors: List[np.ndarray] = []
+        # Determine which reconstructions to process
+        reconstructions_to_process = [self.chunk_reconstructions[-1]] if latest_only else self.chunk_reconstructions
+        
+        for recon in reconstructions_to_process:
+            if recon is None:
+                continue
+            
+            for track_id in recon.TrackIds():
+                track = recon.Track(track_id)
+                p = track.Point()
+                p3 = np.array(p[:3]/p[3], dtype=np.float32)
+                all_points.append(p3)
+                
+                c = np.array(track.Color(), dtype=np.float32)
+                all_colors.append(c)
+
+        if not all_points:
+            return np.array([]), np.array([])
+
+        points_arr = np.asarray(all_points, dtype=np.float32)
+        colors_arr = np.asarray(all_colors, dtype=np.float32)
+        # Normalize colors if in 0-255 range
+        if colors_arr.size > 0 and colors_arr.max() > 1.0:
+            colors_arr = colors_arr / 255.0
+        return points_arr, colors_arr
+
+    def _extract_camera_positions_from_reconstructions(self, latest_only: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Collect camera positions and orientations from PyTheia reconstructions.
+        
+        Args:
+            latest_only: If True, only extract from the latest reconstruction. If False, extract from all reconstructions.
+        """
+        if not self.chunk_reconstructions:
+            return np.array([]), np.array([])
+
+        positions: List[np.ndarray] = []
+        orientations: List[np.ndarray] = []
+
+        # Determine which reconstructions to process
+        reconstructions_to_process = [self.chunk_reconstructions[-1]] if latest_only else self.chunk_reconstructions
+        
+        for recon in reconstructions_to_process:
+            if recon is None:
+                continue
+        
+            for vid in recon.ViewIds():
+                view = recon.View(vid)
+                if not view.IsEstimated() :
+                    continue
+                cam = view.Camera()
+                positions.append(np.array(cam.GetPosition(), dtype=np.float32))
+                R = cam.GetOrientationAsRotationMatrix().T
+                orientations.append(np.array(R, dtype=np.float32))
+
+        return (
+            np.asarray(positions, dtype=np.float32) if positions else np.array([]),
+            np.asarray(orientations, dtype=np.float32) if orientations else np.array([]),
+        )
+
+    def _extract_camera_poses_with_names(self, latest_only: bool = False) -> List[Tuple[str, np.ndarray, np.ndarray]]:
+        """Collect (view_name, position, orientation) tuples from reconstructions.
+
+        Args:
+            latest_only: If True, only extract from the latest reconstruction.
+        Returns:
+            List of tuples (name, position(3,), orientation(3x3)) preserving encounter order.
+        """
+        if not self.chunk_reconstructions:
+            return []
+
+        reconstructions_to_process = [self.chunk_reconstructions[-1]] if latest_only else self.chunk_reconstructions
+        poses_with_names: List[Tuple[str, np.ndarray, np.ndarray]] = []
+
+        for recon in reconstructions_to_process:
+            if recon is None:
+                continue
+            for vid in sorted(recon.ViewIds()):
+                view = recon.View(vid)
+                if not view.IsEstimated():
+                    continue
+                try:
+                    name = view.Name()
+                except Exception:
+                    # Fallback if name not available
+                    name = f"view_{int(vid)}"
+                cam = view.Camera()
+                pos = np.array(cam.GetPosition(), dtype=np.float32)
+                R = cam.GetOrientationAsRotationMatrix().T
+                poses_with_names.append((name, pos, np.array(R, dtype=np.float32)))
+
+        return poses_with_names
+
+    def build_full_camera_trajectory_from_reconstructions(self) -> None:
+        """Build full camera trajectory/orientations from all reconstructions.
+
+        Deduplicates views by name to avoid duplicate entries across chunks.
+        Preserves first-seen order across reconstructions.
+        """
+        entries = self._extract_camera_poses_with_names(latest_only=False)
+        if not entries:
+            self.full_camera_trajectory = []
+            self.full_camera_orientations = []
+            return
+
+        seen_names: set = set()
+        traj: List[np.ndarray] = []
+        rots: List[np.ndarray] = []
+        for name, pos, R in entries:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            traj.append(pos)
+            rots.append(R)
+
+        self.full_camera_trajectory = traj
+        self.full_camera_orientations = rots
+
+    def _clear_chunk_data(self, chunk_result: Dict) -> None:
+        """Free heavy per-chunk tensors once reconstruction is available/aligned."""
+        keys_to_drop = [
+            'points', 'local_points', 'conf', 'masks',
+        ]
+        for k in keys_to_drop:
+            if k in chunk_result:
+                try:
+                    del chunk_result[k]
+                except Exception:
+                    pass
     
     def start_background_loader(self, all_image_paths: List):
         """Start background image loading for the entire sequence using chunk-based loading."""
@@ -214,13 +350,13 @@ class Pi3SLAMOnlineRerun:
             # Start visualization process
             self.vis_process = mp.Process(
                 target=visualization_process,
-                args=(self.vis_queue, self.rerun_port, self.max_points_visualization, self.update_interval)
+                args=(self.vis_queue, self.visualization_port, self.max_points_visualization, self.update_interval)
             )
             self.vis_process.start()
             self.vis_running = True
             
-            print(f"🎥 Rerun visualization process started on port {self.rerun_port}")
-            print(f"🌐 Open http://localhost:{self.rerun_port} in your browser to view the visualization")
+            print(f"🎥 Rerun visualization process started on port {self.visualization_port}")
+            print(f"🌐 Open http://localhost:{self.visualization_port} in your browser to view the visualization")
             
         except Exception as e:
             print(f"❌ Failed to start visualization process: {e}")
@@ -249,7 +385,7 @@ class Pi3SLAMOnlineRerun:
             except Exception as e:
                 print(f"⚠️  Error stopping visualization process: {e}")
     
-    def process_chunks_with_background_loader(self) -> List[Dict]:
+    def process_chunks_with_background_loader(self, auto_close_visualization: bool = True) -> List[Dict]:
         """
         Process all chunks using the background loader for optimal performance.
         """
@@ -259,6 +395,8 @@ class Pi3SLAMOnlineRerun:
         results = []
         chunk_count = 0
         total_chunks = len(self.background_loader.dataset)
+        processing_start_time = time.time()
+        frames_before = len(self.timestamps)
         
         print(f"\n🔄 Starting chunk-based processing with {total_chunks} chunks...")
         print("=" * 60)
@@ -274,7 +412,9 @@ class Pi3SLAMOnlineRerun:
                 print(f"\n📦 Processing chunk {chunk_count}/{total_chunks}: frames {start_idx + 1}-{end_idx}")
                 
                 # Process chunk directly with loaded images
-                result = self._process_chunk_with_images(chunk_images, chunk_paths, start_idx, end_idx)
+                _t0 = time.time()
+                result = self._process_chunk_with_images(chunk_images, chunk_paths)
+                self._record_timing("process_chunk", time.time() - _t0)
                 results.append(result)
                 
                 # Small delay to allow visualization to update
@@ -287,6 +427,19 @@ class Pi3SLAMOnlineRerun:
             print(f"\n❌ Error during processing: {e}")
             raise
         
+        # Optionally close visualization after processing completes
+        if auto_close_visualization:
+            self.stop_visualization()
+
+        # Print timing after processing all chunks
+        self.print_timing_statistics()
+
+        # Compute and print average FPS over the whole processing
+        elapsed_total = max(1e-6, time.time() - processing_start_time)
+        frames_after = len(self.timestamps)
+        frames_processed = max(0, frames_after - frames_before)
+        avg_fps = frames_processed / elapsed_total
+        print(f"\n⏱️ Overall performance: {frames_processed} frames in {elapsed_total:.2f}s  ->  average {avg_fps:.2f} FPS")
         return results
 
     def interpolate_world_points_for_ref(self, result, keypoints):
@@ -310,9 +463,40 @@ class Pi3SLAMOnlineRerun:
             'masks': masks.squeeze(1).permute(0, 2, 1).bool()
         }
         return return_result
+
+    def _record_timing(self, name: str, duration_s: float) -> None:
+        """Accumulate timing statistics per step name."""
+        entry = self.timing_stats.setdefault(name, {"total": 0.0, "count": 0})
+        entry["total"] += float(duration_s)
+        entry["count"] += 1
+
+    def get_timing_statistics(self) -> Dict[str, Dict[str, float]]:
+        """Return timing totals and averages per step."""
+        summary: Dict[str, Dict[str, float]] = {}
+        for k, v in self.timing_stats.items():
+            total = v.get("total", 0.0)
+            count = max(1, int(v.get("count", 0)))
+            summary[k] = {"total_s": total, "count": count, "avg_ms": 1000.0 * total / count}
+        return summary
+
+    def print_timing_statistics(self) -> None:
+        """Pretty-print timing statistics sorted by total time descending."""
+        stats = self.get_timing_statistics()
+        if not stats:
+            print("⏱️ No timing data recorded")
+            return
+        print("\n⏱️ Timing summary (totals and averages):")
+        for name, data in sorted(stats.items(), key=lambda x: x[1]["total_s"], reverse=True):
+            print(f"   {name:32s} total={data['total_s']:.3f}s  count={data['count']:4d}  avg={data['avg_ms']:.1f}ms")
     
-    def _process_chunk_with_images(self, chunk_images: torch.Tensor, chunk_paths: List, 
-                                  start_idx: int, end_idx: int) -> Dict:
+    def _get_scale_factor_for_pi3(self, moge_metric_depth, pi3_metric_depth, mask):
+        moge_metric_depth = moge_metric_depth[mask]
+        pi3_metric_depth = pi3_metric_depth[mask]
+        scale_factor = moge_metric_depth / pi3_metric_depth
+        scale_factor = scale_factor.median()
+        return scale_factor
+    
+    def _process_chunk_with_images(self, chunk_images: torch.Tensor, chunk_paths: List) -> Dict:
         """Process a chunk using pre-loaded images."""
         # Extract timestamps for this chunk
         actual_paths = []
@@ -329,26 +513,44 @@ class Pi3SLAMOnlineRerun:
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         
         with torch.no_grad():
+            _t0_inf = time.time()
             with torch.amp.autocast('cuda', dtype=dtype):
                 result = self.model(chunk_images.to(self.device))
-        
-        # Estimate camera parameters for this chunk (if enabled)
-        camera_params = None
-        if self.estimate_camera_params:
-            camera_params = estimate_camera_parameters_single_chunk(result)
-            print_camera_parameters_summary(camera_params)
-        
-        # Extract keypoints for this chunk (if enabled)
-        keypoint_results = None
-        if self.extract_keypoints and self.keypoint_extractor is not None:
-            keypoint_results = self.keypoint_extractor.extract_with_colors(chunk_images)
-            print(f"🔍 Extracted {keypoint_results['keypoints'].shape[-2]} keypoints per frame")
-        
+            self._record_timing("model_inference", time.time() - _t0_inf)
+                
         # Process masks
         masks = torch.sigmoid(result['conf'][..., 0]) > 0.1
         non_edge = ~depth_edge(result['local_points'][..., 2], rtol=0.03)
         masks = torch.logical_and(masks, non_edge)[0]
-        
+
+
+        if self.moge_model is not None:
+            _t0_moge = time.time()
+            # get scale factor from first image
+            with torch.amp.autocast('cuda', dtype=dtype):
+                moge_metric_depth = self.moge_model.infer(chunk_images[0,0].to("cuda"))["depth"]
+            pi3_metric_depth = result['local_points'][0,0][..., 2]
+            mask = masks[0]
+            scale_factor = self._get_scale_factor_for_pi3(moge_metric_depth, pi3_metric_depth, mask)
+            print(f"  MOGE Scale factor: {scale_factor}")
+            # Scale the reconstruction
+            result["local_points"] = result["local_points"] * scale_factor
+            result["points"] = result["points"] * scale_factor
+            result["camera_poses"][:,:,:3,3] = result["camera_poses"][:,:,:3,3] * scale_factor
+            result["camera_poses_cw"] = torch.linalg.inv(result["camera_poses"])
+            result["original_width"] = self.target_size[1]
+            result["original_height"] = self.target_size[0]
+            self._record_timing("moge_inference_and_scale", time.time() - _t0_moge)
+
+        # Estimate camera parameters for this chunk (if enabled)
+        camera_params = None
+        if self.estimate_camera_params:
+            _t0_cam = time.time()
+            camera_params = estimate_camera_parameters_single_chunk(result)
+            self._record_timing("estimate_camera_params", time.time() - _t0_cam)
+            print_camera_parameters_summary(camera_params)
+
+
         # Move all results to CPU to save GPU memory
         cpu_result = {
             'points': result['points'][0].cpu(),
@@ -359,76 +561,98 @@ class Pi3SLAMOnlineRerun:
             'image_paths': chunk_paths,
             'images': chunk_images.squeeze(0).cpu()
         }
+
+        # Remove all tensors from result that are still on gpu
+        del result
         
+        _t0_kp = time.time()
+        keypoint_results = self.keypoint_extractor.extract_with_colors(chunk_images)
+        self._record_timing("keypoint_extraction", time.time() - _t0_kp)
+        print(f"🔍 Extracted {keypoint_results['keypoints'].shape[-2]} keypoints per frame")
+    
         # Add camera parameters if estimated
-        if camera_params is not None:
-            cpu_result['camera_params'] = {k: v.cpu() for k, v in camera_params.items()}
+        cpu_result['camera_params'] = {k: v.cpu() for k, v in camera_params.items()}
         
         # Add keypoint results if extracted
-        if keypoint_results is not None:
-            # interpolate 3D points for each keypoint
-            res = self.interpolate_world_points_for_ref(cpu_result, keypoint_results['keypoints'])
-            cpu_result['points_kp'] = res['points']
-            cpu_result['local_points_kp'] = res['local_points']
-            cpu_result['conf_kp'] = res['conf']
-            cpu_result['masks_kp'] = res['masks']
+        # interpolate 3D points for each keypoint
+        _t0_interp = time.time()
+        res = self.interpolate_world_points_for_ref(cpu_result, keypoint_results['keypoints'])
+        self._record_timing("interpolate_points", time.time() - _t0_interp)
 
-            cpu_result['keypoints'] = keypoint_results['keypoints'].cpu()
-            cpu_result['descriptors'] = keypoint_results['descriptors'].cpu()
-            cpu_result['scores'] = keypoint_results['scores'].cpu()
-            cpu_result['colors'] = keypoint_results['colors'].cpu()
-        
+        cpu_result['points'] = res['points']
+        cpu_result['local_points'] = res['local_points']
+        cpu_result['conf'] = res['conf']
+        cpu_result['masks'] = res['masks']
+        cpu_result['keypoints'] = keypoint_results['keypoints'].cpu()
+        cpu_result['descriptors'] = keypoint_results['descriptors'].cpu()
+        cpu_result['scores'] = keypoint_results['scores'].cpu()
+        cpu_result['colors'] = keypoint_results['colors'].cpu()
+    
         # Create chunk reconstruction if enabled
         chunk_reconstruction = None
         
         # Set target size for reconstruction
-        if hasattr(self, 'target_size') and self.target_size is not None:
-            self.chunk_reconstructor.set_target_size(self.target_size[0], self.target_size[1])
+        self.chunk_reconstructor.set_target_size(self.target_size[1], self.target_size[0])
         
         # Add camera intrinsics if available
         if camera_params is not None:
             cpu_result['intrinsics'] = camera_params['intrinsics']
         
         # Create reconstruction
-        chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(cpu_result)
-        #self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 
-        #                                           save_path="custom_projection_"+str(len(self.chunk_results))+".gif", fps=1)
-        self.chunk_reconstructor.print_reconstruction_summary()
+        _t0_recon = time.time()
+        chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(
+            cpu_result, max_observations_per_track = self.max_observations_per_track)
+        self._record_timing("create_reconstruction", time.time() - _t0_recon)
+
+        if self.save_debug_projections:
+            if hasattr(self, 'output_dir') and self.output_dir:
+                debug_gif_dir = os.path.join(self.output_dir, 'debug_projections')
+                os.makedirs(debug_gif_dir, exist_ok=True)
+                gif_filename = f"chunk_{len(self.chunk_reconstructions):03d}_projections.gif"
+                gif_path = os.path.join(debug_gif_dir, gif_filename)
+            else:
+                # Fallback to current directory
+                gif_path = f"chunk_{len(self.chunk_reconstructions):03d}_projections.gif"
+
+            self.chunk_reconstructor.debug_projections(cpu_result, 0, [1, 2, 3, 4, 5, 6, 7, 8, 9], 
+                                                      save_path=gif_path, fps=1)
+            
+            self.chunk_reconstructor.print_reconstruction_summary()
         
         # Store reconstruction in memory instead of saving to disk in online mode
         self.chunk_reconstructions.append(chunk_reconstruction)
-        print(f"💾 Stored chunk reconstruction {len(self.chunk_results)} in memory")
         
         # Only save to disk if explicitly enabled (for offline processing)
         if self.save_chunk_reconstructions:
-            self._save_chunk_reconstruction(chunk_reconstruction, len(self.chunk_results))
+            self._save_chunk_reconstruction(chunk_reconstruction, len(self.chunk_reconstructions))
     
-        # Print camera parameters summary (if estimated)
-        if camera_params is not None:
-            print_camera_parameters_summary(camera_params)
+        print_camera_parameters_summary(camera_params)
         
         # Generate camera IDs for this chunk
-        chunk_idx = len(self.chunk_results)
+        chunk_idx = len(self.chunk_reconstructions)
         start_frame = chunk_idx * (self.chunk_length - self.overlap)
         chunk_camera_ids = list(range(start_frame + 1, start_frame + len(chunk_paths) + 1))
-        
-        # Store chunk result
-        self.chunk_results.append(cpu_result)
-        self.camera_ids.append(chunk_camera_ids)
         
         # Track current chunk for frame display
         self.current_chunk_result = cpu_result
         
         # Align with previous chunks
+        _t0_align = time.time()
         aligned_chunk = self._align_chunk_online(cpu_result, chunk_camera_ids)
+        self._record_timing("align_chunk", time.time() - _t0_align)
         
         # Update visualization
         if self.vis_running:
-            self._update_visualization()
+            _t0_viz = time.time()
+            self._update_visualization(aligned_chunk)
+            self._record_timing("update_visualization", time.time() - _t0_viz)
         
         # Print progress
-        print(f"📊 Chunk {len(self.chunk_results)}: {len(chunk_paths)} frames processed")
-        print(f"   Total points: {len(self.aligned_points[-1]) if self.aligned_points else 0}")
+        print(f"📊 Chunk {len(self.chunk_reconstructions)}: {len(chunk_paths)} frames processed")
+        # Get total points from reconstructions
+        all_points, _ = self._extract_points_colors_from_reconstructions(latest_only=False)
+        total_points = len(all_points) if all_points.size > 0 else 0
+        print(f"   Total points: {total_points}")
         
         return {
             'chunk_result': cpu_result,
@@ -436,389 +660,53 @@ class Pi3SLAMOnlineRerun:
             'camera_ids': chunk_camera_ids,
             'timestamps': chunk_timestamps
         }
-    
-    def _optimize_sim3_pytheia(self, source_points: np.ndarray, target_points: np.ndarray, confidences: np.ndarray) -> np.ndarray:
 
-        import pytheia as pt
-        options = pt.sfm.Sim3AlignmentOptions()
-        
-        # Test default values
-        options.alignment_type == pt.sfm.Sim3AlignmentType.ROBUST_POINT_TO_POINT
-        options.max_iterations == 20
-        options.huber_threshold == 1.0
-        options.verbose == False
-        
-        point_weights = confidences
-        options.set_point_weights(point_weights)
-
-        summary = pt.sfm.OptimizeAlignmentSim3(source_points, target_points, options)
-                
-        # Check that estimated parameters are close to ground truth
-        T_source_to_target = pt.math.Sim3d.exp(summary.sim3_params).matrix()
-        
-        return T_source_to_target
     
     def _align_chunk_online(self, chunk_result: Dict, chunk_camera_ids: List[int]) -> Dict:
-        """Align a new chunk with previously processed chunks."""
-        if len(self.chunk_results) == 1:
-            # First chunk, no alignment needed
-            aligned_points = chunk_result['points']
-            aligned_poses = chunk_result['camera_poses']
-            aligned_colors = extract_colors_from_chunk(chunk_result)
+        """Align a new chunk using ONLY reconstruction-based alignment and then clear chunk data."""
+
+        if len(self.chunk_reconstructions) == 1:
+            # First chunk: record end pose from reconstruction (if any) and clear tensors
+            cam_positions, cam_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
+            if cam_positions.size > 0:
+                self.chunk_end_poses.append(cam_positions[-1])
             
-            # Use keypoint points for visualization if available
-            if 'points_kp' in chunk_result:
-                aligned_keypoint_points = chunk_result['points_kp']
-                aligned_keypoint_colors = chunk_result['colors']  # Use keypoint colors
-            else:
-                aligned_keypoint_points = aligned_points
-                aligned_keypoint_colors = aligned_colors
+            # Extract aligned data from the first reconstruction
+            aligned_points, aligned_colors = self._extract_points_colors_from_reconstructions(latest_only=True)
+            aligned_camera_positions, aligned_camera_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
             
-            # Store aligned data
-            self.aligned_points.append(aligned_points.reshape(-1, 3).cpu().numpy())
-            self.aligned_camera_poses.append(aligned_poses.cpu().numpy())
-            self.aligned_camera_ids.extend(chunk_camera_ids)
-            self.aligned_colors.append(aligned_colors.reshape(-1, 3).cpu().numpy())
-            
-            # Store keypoint data for visualization
-            if 'points_kp' in chunk_result:
-                self.aligned_keypoint_points = aligned_keypoint_points.reshape(-1, 3).cpu().numpy()
-                self.aligned_keypoint_colors = aligned_keypoint_colors.reshape(-1, 3).cpu().numpy()
-            else:
-                self.aligned_keypoint_points = aligned_points.reshape(-1, 3).cpu().numpy()
-                self.aligned_keypoint_colors = aligned_colors.reshape(-1, 3).cpu().numpy()
-            
-            # Store camera trajectory data (always kept in memory)
-            poses_np = aligned_poses.cpu().numpy()
-            for pose in poses_np:
-                camera_pos = pose[:3, 3]  # Translation part
-                camera_rot = pose[:3, :3]  # Rotation part
-                self.full_camera_trajectory.append(camera_pos)
-                self.full_camera_orientations.append(camera_rot)
-            
-            # Store end pose of this chunk for linestrip visualization
-            if len(poses_np) > 0:
-                end_pose = poses_np[-1]  # Last pose of the chunk
-                self.chunk_end_poses.append(end_pose[:3, 3])  # Store position only
-            
-            # Store end frame from this chunk for visualization
-            if 'images' in chunk_result:
-                # Get the last frame of the chunk
-                images_tensor = chunk_result['images']
-                print(f"📷 Images tensor shape: {images_tensor.shape}")
-                
-                # Handle different tensor shapes
-                if len(images_tensor.shape) == 5:  # (B, N, C, H, W) - batch dimension still present
-                    end_frame = images_tensor[0, -1]  # Remove batch, get last frame: (C, H, W)
-                    print(f"📷 End frame shape (5D->3D): {end_frame.shape}")
-                elif len(images_tensor.shape) == 4:  # (N, C, H, W) - batch already removed
-                    end_frame = images_tensor[-1]  # Last frame: (C, H, W)
-                    print(f"📷 End frame shape (4D->3D): {end_frame.shape}")
-                else:
-                    end_frame = images_tensor  # Already single frame
-                    print(f"📷 End frame shape (already 3D): {end_frame.shape}")
-                
-                # Convert to RGB format for display (CHW -> HWC)
-                if end_frame.shape[0] == 3:  # CHW format
-                    frame_rgb = end_frame.permute(1, 2, 0).numpy()
-                    print(f"📷 Frame RGB shape (CHW->HWC): {frame_rgb.shape}")
-                else:
-                    frame_rgb = end_frame.numpy()
-                    print(f"📷 Frame RGB shape (direct): {frame_rgb.shape}")
-                
-                # Normalize to [0, 255] range
-                if frame_rgb.max() <= 1.0:
-                    frame_rgb = (frame_rgb * 255).astype(np.uint8)
-                
-                print(f"📷 Final frame shape: {frame_rgb.shape}, dtype: {frame_rgb.dtype}")
-                self.current_chunk_end_frame = frame_rgb
-            
-            # Manage memory after storing new chunk
-            self._manage_memory()
-            
-            # Set as current reference chunk (like offline version)
-            self.current_reference_chunk = {
-                'points': aligned_points,
-                'camera_poses': aligned_poses,
-                'conf': chunk_result['conf'],
-                'masks': chunk_result['masks'],
-            }
-            # Store keypoint data in reference chunk if available
-            if 'points_kp' in chunk_result:
-                self.current_reference_chunk['points_kp'] = aligned_keypoint_points
-                self.current_reference_chunk['colors_kp'] = aligned_keypoint_colors
-                self.current_reference_chunk['conf_kp'] = chunk_result['conf_kp']
-                self.current_reference_chunk['masks_kp'] = chunk_result['masks_kp']
-            
-            self.current_reference_camera_ids = chunk_camera_ids
-            
+            self._clear_chunk_data(chunk_result)
             return {
                 'points': aligned_points,
-                'camera_poses': aligned_poses,
+                'camera_poses': aligned_camera_positions,
+                'camera_orientations': aligned_camera_orientations,
                 'colors': aligned_colors,
                 'transformation': np.eye(4)
             }
-        
-        # Try reconstruction-based alignment first if reconstructions are available
+
+        # Align reconstructions and update chunk end pose
         transformation_matrix = self.align_with_reconstruction_tracks(chunk_result, chunk_camera_ids)
-        
-        # Align with current reference chunk (like offline version)
-        current_chunk = self.current_reference_chunk
-        current_camera_ids = self.current_reference_camera_ids
-        
-        # Find overlapping cameras
-        overlap_cameras_current = current_camera_ids[-self.overlap:] if len(current_camera_ids) >= self.overlap else current_camera_ids
-        overlap_cameras_next = chunk_camera_ids[:self.overlap] if len(chunk_camera_ids) >= self.overlap else chunk_camera_ids
-        
-        common_camera_ids = set(overlap_cameras_current) & set(overlap_cameras_next)
-        
-        # Debug: Print overlap information
-        self._debug_print_overlap_indices(overlap_cameras_current, overlap_cameras_next, common_camera_ids, chunk_result)
-        
-        if len(common_camera_ids) >= 2:
-            # Use keypoint points for alignment if available
-            if 'points_kp' in current_chunk and 'points_kp' in chunk_result:
-                # Use keypoint points for correspondence finding
-                points1 = current_chunk['points_kp']
-                points2 = chunk_result['points_kp']
-                conf1 = current_chunk.get('conf_kp', None)
-                conf2 = chunk_result.get('conf_kp', None)
-                print(f"🔍 Using keypoint points for alignment: {points1.shape} -> {points2.shape}")
-            else:
-                # Fallback to full point clouds
-                points1 = current_chunk['points']
-                points2 = chunk_result['points']
-                conf1 = current_chunk.get('conf', None)
-                conf2 = chunk_result.get('conf', None)
-                print(f"🔍 Using full point clouds for alignment: {points1.shape} -> {points2.shape}")
-            
-            # Find corresponding points
-            corresponding_points1, corresponding_points2, mean_conf = find_corresponding_points(
-                points1, points2,
-                current_camera_ids, chunk_camera_ids,
-                conf1=conf1,
-                conf2=conf2,
-                subsample_factor=self.correspondence_subsample_factor,  # Use configurable subsampling
-                conf_threshold=self.conf_threshold,
-            )
 
+        cam_positions, cam_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
+        if cam_positions.size > 0:
+            self.chunk_end_poses.append(cam_positions[-1])
 
-            if len(corresponding_points1) >= 10:
-                # Use reconstruction-based transformation if available, otherwise estimate from point correspondences
-                if transformation_matrix is not None:
-                    print("🔧 Using reconstruction-based transformation")
-                    T_source_to_target = transformation_matrix
-                else:
-                    print("🔧 Using point correspondence-based transformation")
-                    # Estimate SIM3 transformation using robust Open3D RANSAC + ICP
-                    T_source_to_target = self._optimize_sim3_pytheia(
-                        corresponding_points2, corresponding_points1, mean_conf)
-                
-                # Apply transformation to both full points and keypoint points
-                N, H, W, _ = chunk_result['points'].shape
-                transformed_points = apply_transformation_to_points(chunk_result['points'].reshape(N, H*W, 3), T_source_to_target)
-                transformed_poses = apply_transformation_to_poses(chunk_result['camera_poses'], T_source_to_target)
-                
-                # Transform keypoint points if available
-                if 'points_kp' in chunk_result:
-                    transformed_keypoint_points = apply_transformation_to_points(chunk_result['points_kp'], T_source_to_target)
-                else:
-                    transformed_keypoint_points = transformed_points
-                
-                # Extract colors for transformed points
-                aligned_colors = extract_colors_from_chunk(chunk_result)
-                
-                # Store aligned data (excluding overlap)
-                overlap_size = self.overlap
-                self.aligned_points.append(transformed_points[overlap_size:].reshape(-1, 3).cpu().numpy())
-                self.aligned_camera_poses.append(transformed_poses[overlap_size:].cpu().numpy())
-                self.aligned_camera_ids.extend(chunk_camera_ids[overlap_size:])
-                self.aligned_colors.append(aligned_colors[overlap_size:].reshape(-1, 3).cpu().numpy())
-                
-                # Store keypoint data for visualization
-                if 'points_kp' in chunk_result:
-                    self.aligned_keypoint_points = transformed_keypoint_points.reshape(-1, 3).cpu().numpy()
-                    self.aligned_keypoint_colors = chunk_result['colors'].reshape(-1, 3).cpu().numpy()
-                else:
-                    self.aligned_keypoint_points = transformed_points.reshape(-1, 3).cpu().numpy()
-                    self.aligned_keypoint_colors = aligned_colors.reshape(-1, 3).cpu().numpy()
-                
-                # Store camera trajectory data (always kept in memory) - excluding overlap
-                poses_np = transformed_poses[overlap_size:].cpu().numpy()
-                for pose in poses_np:
-                    camera_pos = pose[:3, 3]  # Translation part
-                    camera_rot = pose[:3, :3]  # Rotation part
-                    self.full_camera_trajectory.append(camera_pos)
-                    self.full_camera_orientations.append(camera_rot)
-                
-                # Store start and end frames from this chunk for visualization
-                if 'images' in chunk_result:
-                    # Get the first and last frames of the chunk
-                    images_tensor = chunk_result['images']
-                    
-                    # Handle different tensor shapes
-                    if len(images_tensor.shape) == 5:  # (B, N, C, H, W) - batch dimension still present
-                        start_frame = images_tensor[0, 0]  # Remove batch, get first frame: (C, H, W)
-                        end_frame = images_tensor[0, -1]  # Remove batch, get last frame: (C, H, W)
-                    elif len(images_tensor.shape) == 4:  # (N, C, H, W) - batch already removed
-                        start_frame = images_tensor[0]  # First frame: (C, H, W)
-                        end_frame = images_tensor[-1]  # Last frame: (C, H, W)
-                    else:
-                        start_frame = images_tensor  # Already single frame
-                        end_frame = images_tensor  # Already single frame
-                    
-                    # Convert to RGB format for display (CHW -> HWC)
-                    if start_frame.shape[0] == 3:  # CHW format
-                        start_rgb = start_frame.permute(1, 2, 0).numpy()
-                    else:
-                        start_rgb = start_frame.numpy()
-                    
-                    if end_frame.shape[0] == 3:  # CHW format
-                        end_rgb = end_frame.permute(1, 2, 0).numpy()
-                    else:
-                        end_rgb = end_frame.numpy()
-                    
-                    # Normalize to [0, 255] range
-                    if start_rgb.max() <= 1.0:
-                        start_rgb = (start_rgb * 255).astype(np.uint8)
-                    if end_rgb.max() <= 1.0:
-                        end_rgb = (end_rgb * 255).astype(np.uint8)
-                    
-                    self.current_chunk_start_frame = start_rgb
-                    self.current_chunk_end_frame = end_rgb
-            
-                # Manage memory after storing new chunk
-                self._manage_memory()
-                
-                # Update current reference chunk for next iteration (like offline version)
-                self.current_reference_chunk = {
-                    'points': transformed_points,
-                    'camera_poses': transformed_poses,
-                    'conf': chunk_result['conf'],
-                    'masks': chunk_result['masks']
-                }
-                # Store keypoint data in reference chunk if available
-                if 'points_kp' in chunk_result:
-                    self.current_reference_chunk['points_kp'] = transformed_keypoint_points
-                    self.current_reference_chunk['colors_kp'] = chunk_result['colors']
-                    self.current_reference_chunk['conf_kp'] = chunk_result['conf_kp']
-                    self.current_reference_chunk['masks_kp'] = chunk_result['masks_kp']
-                
-                self.current_reference_camera_ids = chunk_camera_ids
-                
-                return {
-                    'points': transformed_points,
-                    'camera_poses': transformed_poses,
-                    'colors': aligned_colors,
-                    'transformation': T_source_to_target
-                }
-            else:
-                print(f"⚠️  Warning: Insufficient corresponding points ({len(corresponding_points1)}), using identity transformation")
-        else:
-            print(f"⚠️  Warning: Insufficient overlapping cameras ({len(common_camera_ids)}), using identity transformation")
-    
-        # Fallback: no transformation
-        aligned_points = chunk_result['points']
-        aligned_poses = chunk_result['camera_poses']
-        aligned_colors = extract_colors_from_chunk(chunk_result)
-        
-        # Use keypoint points for visualization if available
-        if 'points_kp' in chunk_result:
-            aligned_keypoint_points = chunk_result['points_kp']
-            aligned_keypoint_colors = chunk_result['colors']  # Use keypoint colors
-        else:
-            aligned_keypoint_points = aligned_points
-            aligned_keypoint_colors = aligned_colors
-        
-        # Store aligned data
-        self.aligned_points.append(aligned_points.reshape(-1, 3).cpu().numpy())
-        self.aligned_camera_poses.append(aligned_poses.cpu().numpy())
-        self.aligned_camera_ids.extend(chunk_camera_ids)
-        self.aligned_colors.append(aligned_colors.reshape(-1, 3).cpu().numpy())
-        
-        # Store keypoint data for visualization
-        if 'points_kp' in chunk_result:
-            self.aligned_keypoint_points = aligned_keypoint_points.reshape(-1, 3).cpu().numpy()
-            self.aligned_keypoint_colors = aligned_keypoint_colors.reshape(-1, 3).cpu().numpy()
-        else:
-            self.aligned_keypoint_points = aligned_points.reshape(-1, 3).cpu().numpy()
-            self.aligned_keypoint_colors = aligned_colors.reshape(-1, 3).cpu().numpy()
-        
-        # Store camera trajectory data (always kept in memory)
-        poses_np = aligned_poses.cpu().numpy()
-        for pose in poses_np:
-            camera_pos = pose[:3, 3]  # Translation part
-            camera_rot = pose[:3, :3]  # Rotation part
-            self.full_camera_trajectory.append(camera_pos)
-            self.full_camera_orientations.append(camera_rot)
-        
-        # Store end pose of this chunk for linestrip visualization
-        if len(poses_np) > 0:
-            end_pose = poses_np[-1]  # Last pose of the chunk
-            self.chunk_end_poses.append(end_pose[:3, 3])  # Store position only
-        
-        # Store start and end frames from this chunk for visualization
-        if 'images' in chunk_result:
-            # Get the first and last frames of the chunk
-            images_tensor = chunk_result['images']
-            
-            # Handle different tensor shapes
-            if len(images_tensor.shape) == 5:  # (B, N, C, H, W) - batch dimension still present
-                start_frame = images_tensor[0, 0]  # Remove batch, get first frame: (C, H, W)
-                end_frame = images_tensor[0, -1]  # Remove batch, get last frame: (C, H, W)
-            elif len(images_tensor.shape) == 4:  # (N, C, H, W) - batch already removed
-                start_frame = images_tensor[0]  # First frame: (C, H, W)
-                end_frame = images_tensor[-1]  # Last frame: (C, H, W)
-            else:
-                start_frame = images_tensor  # Already single frame
-                end_frame = images_tensor  # Already single frame
-            
-            # Convert to RGB format for display (CHW -> HWC)
-            if start_frame.shape[0] == 3:  # CHW format
-                start_rgb = start_frame.permute(1, 2, 0).numpy()
-            else:
-                start_rgb = start_frame.numpy()
-            
-            if end_frame.shape[0] == 3:  # CHW format
-                end_rgb = end_frame.permute(1, 2, 0).numpy()
-            else:
-                end_rgb = end_frame.numpy()
-            
-            # Normalize to [0, 255] range
-            if start_rgb.max() <= 1.0:
-                start_rgb = (start_rgb * 255).astype(np.uint8)
-            if end_rgb.max() <= 1.0:
-                end_rgb = (end_rgb * 255).astype(np.uint8)
-            
-            self.current_chunk_start_frame = start_rgb
-            self.current_chunk_end_frame = end_rgb
-        
-        # Manage memory after storing new chunk
-        self._manage_memory()
-        
-        # Update current reference chunk for next iteration (like offline version)
-        self.current_reference_chunk = {
-            'points': aligned_points,
-            'camera_poses': aligned_poses,
-            'conf': chunk_result['conf'],
-            'masks': chunk_result['masks']
-        }
-        # Store keypoint data in reference chunk if available
-        if 'points_kp' in chunk_result:
-            self.current_reference_chunk['points_kp'] = aligned_keypoint_points
-            self.current_reference_chunk['colors_kp'] = aligned_keypoint_colors
-            self.current_reference_chunk['conf_kp'] = chunk_result['conf_kp']
-            self.current_reference_chunk['masks_kp'] = chunk_result['masks_kp']
-        
-        self.current_reference_camera_ids = chunk_camera_ids
-        
+        # Extract aligned data from the latest reconstruction (which now includes the aligned data)
+        aligned_points, aligned_colors = self._extract_points_colors_from_reconstructions(latest_only=True)
+        aligned_camera_positions, aligned_camera_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
+
+        # Clear heavy tensors; rely on reconstructions
+        self._clear_chunk_data(chunk_result)
+
         return {
             'points': aligned_points,
-            'camera_poses': aligned_poses,
+            'camera_poses': aligned_camera_positions,
+            'camera_orientations': aligned_camera_orientations,
             'colors': aligned_colors,
-            'transformation': np.eye(4)
+            'transformation': transformation_matrix if transformation_matrix is not None else np.eye(4)
         }
-    
+
+
     def _save_chunk_reconstruction(self, reconstruction, chunk_idx: int):
         """
         Save chunk reconstruction to disk.
@@ -900,7 +788,6 @@ class Pi3SLAMOnlineRerun:
             print("⚠️  Warning: No output directory specified for saving reconstructions")
             return
         
-        import pytheia as pt
         
         # Create reconstructions subdirectory
         recon_dir = os.path.join(output_dir, 'reconstructions')
@@ -944,52 +831,19 @@ class Pi3SLAMOnlineRerun:
             print("🔍 Skipping reconstruction-based alignment: need at least 2 reconstructions")
             return None
         
-        if not self.use_reconstruction_alignment:
-            print("🔍 Reconstruction-based alignment disabled")
-            return None
-        
         try:
             # Get the two most recent reconstructions
             recon_ref = self.chunk_reconstructions[-2]  # Previous chunk
             recon_qry = self.chunk_reconstructions[-1]  # Current chunk
-            
-            print(f"\n🔄 Aligning current chunk using PyTheia reconstructions...")
-            
+                        
             # Create view graph matches for overlapping frames
             view_graph_matches = create_view_graph_matches(self.chunk_length, self.overlap)
-            print(f"🔍 View graph matches: {view_graph_matches}")
-            
-            print("🔧 Using complete reconstruction refinement pipeline...")
-            
-            # Generate PLY save path if enabled
-            save_ply_path = None
-            if self.save_transformed_reconstructions and hasattr(self, 'output_dir') and self.output_dir:
-                chunk_idx = len(self.chunk_reconstructions) - 1
-                save_ply_path = os.path.join(self.output_dir, f"chunk_{chunk_idx:06d}_transformed.ply")
-            
-            # Perform complete alignment and refinement
-            debug_output_dir = None
-            if self.save_debug_reconstructions and hasattr(self, 'output_dir') and self.output_dir:
-                debug_output_dir = os.path.join(self.output_dir, 'debug_reconstructions')
-            
+           
             success, alignment_info = align_and_refine_reconstructions(
-                recon_ref, recon_qry, view_graph_matches,
-                self.feature_match_threshold, self.descriptor_match_threshold,
-                save_ply_path, self.save_debug_reconstructions, debug_output_dir,
-                len(self.chunk_reconstructions) - 1  # chunk index
-            )
+                recon_ref, recon_qry, view_graph_matches)
             
-            if success:
-                print(f"✅ Complete reconstruction alignment successful:")
-                print(f"   Common tracks: {alignment_info['num_common_tracks']}")
-                print(f"   Sim3 error: {alignment_info['sim3_summary']['alignment_error']:.6f}")
-                print(f"   BA final cost: {alignment_info['bundle_adjustment']['final_cost']:.6f}")
-                
-                # Return the Sim3 transformation matrix
-                import pytheia as pt
-                sim3_params = alignment_info['sim3_summary']['sim3_params']
-                transformation_matrix = pt.math.Sim3d.exp(sim3_params).matrix()
-                return transformation_matrix
+            if success:                
+                return alignment_info
             else:
                 print(f"❌ Complete reconstruction alignment failed: {alignment_info.get('error', 'unknown')}")
                 return None
@@ -1001,87 +855,7 @@ class Pi3SLAMOnlineRerun:
             traceback.print_exc()
             return None
     
-    def _manage_memory(self):
-        """Manage memory by moving old chunks to disk and keeping only recent ones in memory."""
-        if len(self.aligned_points) <= self.max_chunks_in_memory:
-            return
-        
-        # Move oldest chunks to disk
-        chunks_to_move = len(self.aligned_points) - self.max_chunks_in_memory
-        
-        for i in range(chunks_to_move):
-            chunk_idx = i
-            if chunk_idx < len(self.aligned_points):
-                # Save to disk
-                self._save_chunk_to_disk(
-                    chunk_idx,
-                    self.aligned_points[chunk_idx],
-                    self.aligned_colors[chunk_idx],
-                    self.aligned_camera_poses[chunk_idx]
-                )
-                
-                # Clear from memory (but keep camera trajectory data)
-                self.aligned_points[chunk_idx] = None
-                self.aligned_colors[chunk_idx] = None
-                self.aligned_camera_poses[chunk_idx] = None
-                
-                # Also clear old reconstructions to manage memory (keep last max_chunks_in_memory)
-                if self.chunk_reconstructions and chunk_idx < len(self.chunk_reconstructions):
-                    self.chunk_reconstructions[chunk_idx] = None
-        
-        # Compact lists by removing None entries
-        self.aligned_points = [p for p in self.aligned_points if p is not None]
-        self.aligned_colors = [c for c in self.aligned_colors if c is not None]
-        self.aligned_camera_poses = [p for p in self.aligned_camera_poses if p is not None]
-        self.chunk_reconstructions = [r for r in self.chunk_reconstructions if r is not None]
-        
-        print(f"💾 Moved {chunks_to_move} chunks to disk, keeping {len(self.aligned_points)} in memory")
-        print(f"🔧 Keeping {len(self.chunk_reconstructions)} reconstructions in memory")
-        print(f"📷 Camera trajectory: {len(self.full_camera_trajectory)} poses, {len(self.chunk_end_poses)} chunk end poses")
-        
-        # Log memory usage if monitoring is enabled
-        if self.memory_monitoring:
-            self._log_memory_usage()
-    
-    def _save_chunk_to_disk(self, chunk_idx: int, points: np.ndarray, colors: np.ndarray, poses: np.ndarray):
-        """Save chunk data to disk to free memory."""
-        if self.cache_dir is None:
-            return
-        
-        try:
-            chunk_file = os.path.join(self.cache_dir, f"chunk_{chunk_idx:06d}.npz")
-            np.savez_compressed(
-                chunk_file,
-                points=points,
-                colors=colors,
-                poses=poses
-            )
-        except Exception as e:
-            print(f"⚠️  Failed to save chunk {chunk_idx} to disk: {e}")
-    
-    def _log_memory_usage(self):
-        """Log current memory usage for monitoring."""
-        try:
-            import psutil
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            memory_mb = memory_info.rss / 1024 / 1024  # Convert to MB
-            
-            # Count total points in memory
-            total_points_in_memory = 0
-            for points in self.aligned_points:
-                if points is not None:
-                    total_points_in_memory += len(points)
-            
-            print(f"🧠 Memory usage: {memory_mb:.1f} MB, Points in memory: {total_points_in_memory:,}, Camera poses: {len(self.full_camera_trajectory):,}, Chunk end poses: {len(self.chunk_end_poses)}, Reconstructions: {len(self.chunk_reconstructions)}")
-            
-        except ImportError:
-            # psutil not available, skip memory logging
-            pass
-        except Exception as e:
-            print(f"⚠️  Failed to log memory usage: {e}")
-    
-    def _update_visualization(self):
+    def _update_visualization(self, aligned_chunk_data: Dict = None):
         """Update visualization with current data."""
         if not self.vis_running or self.vis_queue is None:
             return
@@ -1093,17 +867,28 @@ class Pi3SLAMOnlineRerun:
         self._last_viz_update = current_time
         
         try:
-            # Get visualization points
-            all_points, all_colors = self._get_visualization_points()
-            
-            # Get camera trajectory data
-            camera_positions = np.array(self.full_camera_trajectory) if self.full_camera_trajectory else np.array([])
-            camera_orientations = np.array(self.full_camera_orientations) if self.full_camera_orientations else np.array([])
+            # Use aligned data if provided, otherwise fall back to reconstruction data
+            if aligned_chunk_data is not None and aligned_chunk_data.get('points') is not None:
+                # Use the aligned data directly from the alignment process
+                all_points = aligned_chunk_data['points']
+                all_colors = aligned_chunk_data['colors']
+                camera_positions = aligned_chunk_data['camera_poses']
+                camera_orientations = aligned_chunk_data.get('camera_orientations', np.array([]))
+            else:
+                # Fall back to reconstruction-only visualization - only get latest reconstruction data
+                # since all previous data was already sent to rerun before
+                all_points, all_colors = self._get_visualization_points()
+                camera_positions, camera_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
             
             # Get current frame and chunk frames
             current_frame = None
             chunk_start_frame = None
             chunk_end_frame = None
+            
+            # Get keypoint data for visualization
+            current_keypoints = None
+            chunk_start_keypoints = None
+            chunk_end_keypoints = None
             
             if self.current_chunk_result is not None and 'images' in self.current_chunk_result:
                 chunk_images = self.current_chunk_result['images']
@@ -1128,10 +913,22 @@ class Pi3SLAMOnlineRerun:
                         current_frame = (current_frame * 255).astype(np.uint8)
                         chunk_start_frame = (chunk_start_frame * 255).astype(np.uint8)
                         chunk_end_frame = (chunk_end_frame * 255).astype(np.uint8)
-            
+                    
+                    # Extract keypoint data for the current frame (last frame in chunk)
+                    if 'keypoints' in self.current_chunk_result and len(self.current_chunk_result['keypoints']) > 0:
+                        current_keypoints = self.current_chunk_result['keypoints'][-1].numpy()  # Last frame keypoints
+
+                    # Extract keypoint data for the chunk start frame (first frame in chunk)
+                    if 'keypoints' in self.current_chunk_result and len(self.current_chunk_result['keypoints']) > 0:
+                        chunk_start_keypoints = self.current_chunk_result['keypoints'][0].numpy()  # First frame keypoints
+
+                    # Extract keypoint data for the chunk end frame (last frame in chunk)
+                    if 'keypoints' in self.current_chunk_result and len(self.current_chunk_result['keypoints']) > 0:
+                        chunk_end_keypoints = self.current_chunk_result['keypoints'][-1].numpy()  # Last frame keypoints
+
             # Create frame info and statistics
-            frame_info = f"Frame: {len(self.timestamps)}, Chunk: {len(self.chunk_results)}"
-            stats_text = f"Chunks: {len(self.chunk_results)}, Frames: {len(self.timestamps)}, Points: {len(all_points)}"
+            frame_info = f"Frame: {len(self.timestamps)}, Chunk: {len(self.chunk_reconstructions)}"
+            stats_text = f"Chunks: {len(self.chunk_reconstructions)}, Frames: {len(self.timestamps)}, Points: {len(all_points)}"
             
             # Send data to visualization process
             viz_data = {
@@ -1144,7 +941,10 @@ class Pi3SLAMOnlineRerun:
                 'chunk_start_frame': chunk_start_frame,
                 'chunk_end_frame': chunk_end_frame,
                 'frame_info': frame_info,
-                'stats_text': stats_text
+                'stats_text': stats_text,
+                'current_keypoints': current_keypoints,
+                'chunk_start_keypoints': chunk_start_keypoints,
+                'chunk_end_keypoints': chunk_end_keypoints,
             }
             
             # Non-blocking put to avoid blocking the main process
@@ -1157,34 +957,11 @@ class Pi3SLAMOnlineRerun:
             print(f"⚠️  Error sending visualization data: {e}")
     
     def _get_visualization_points(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get subsampled points for visualization."""
-        # Use keypoint points for visualization if available
-        if hasattr(self, 'aligned_keypoint_points') and self.aligned_keypoint_points is not None:
-            # Use keypoint points for visualization
-            all_points = [self.aligned_keypoint_points]
-            all_colors = [self.aligned_keypoint_colors]
-        elif self.aligned_points:
-            # Fallback to full point clouds
-            all_points = []
-            all_colors = []
-            
-            for i, points in enumerate(self.aligned_points):
-                if points is not None:
-                    all_points.append(points)
-                    all_colors.append(self.aligned_colors[i])
-        else:
+        """Get subsampled points for visualization from PyTheia reconstructions only."""
+        # Only get points from the latest reconstruction since all previous data was already sent to rerun
+        combined_points, combined_colors = self._extract_points_colors_from_reconstructions(latest_only=True)
+        if combined_points.size == 0:
             return np.array([]), np.array([])
-        
-        if not all_points:
-            return np.array([]), np.array([])
-        
-        # Combine all points
-        if len(all_points) == 1:
-            combined_points = all_points[0]
-            combined_colors = all_colors[0]
-        else:
-            combined_points = np.concatenate(all_points, axis=0)
-            combined_colors = np.concatenate(all_colors, axis=0)
         
         # Subsample for visualization
         if len(combined_points) > 0:
@@ -1198,16 +975,15 @@ class Pi3SLAMOnlineRerun:
     
     def save_final_result(self, save_path: str, max_points: int = 1000000):
         """Save the final aligned trajectory result."""
-        if not self.aligned_points:
+        # Use reconstruction data instead of old aligned_points
+        all_points, all_colors = self._extract_points_colors_from_reconstructions(latest_only=False)
+        
+        if all_points.size == 0:
             print("No points to save")
             return
         
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        # Combine all aligned points and colors
-        all_points = np.vstack(self.aligned_points)
-        all_colors = np.vstack(self.aligned_colors)
         
         # Subsample if needed
         if len(all_points) > max_points:
@@ -1218,11 +994,11 @@ class Pi3SLAMOnlineRerun:
         # Save point cloud
         print(f"💾 Saving final trajectory to: {save_path}")
         write_ply(torch.from_numpy(all_points), torch.from_numpy(all_colors), save_path, max_points=max_points)
-        print(f"✅ Saved trajectory with {len(all_points)} points from {len(self.chunk_results)} chunks")
+        print(f"✅ Saved trajectory with {len(all_points)} points from {len(self.chunk_reconstructions)} reconstructions")
         
         # Save camera poses
-        if self.full_camera_trajectory:
-            camera_positions = np.array(self.full_camera_trajectory)
+        camera_positions, _ = self._extract_camera_positions_from_reconstructions(latest_only=False)
+        if len(camera_positions) > 0:
             camera_colors = np.full((len(camera_positions), 3), [1.0, 0.0, 0.0])
             
             camera_filename = save_path.replace('.ply', '_camera_poses.ply')
@@ -1238,8 +1014,11 @@ class Pi3SLAMOnlineRerun:
             timestamps: Optional list of timestamps for each pose (if None, will use stored timestamps or frame indices)
             integer_timestamp: If True, saves timestamps as integers (for 7-scenes). Otherwise, saves as float (for EuRoC).
         """
+        # Build full trajectory from reconstructions if empty or lengths mismatch timestamps
         if not self.full_camera_trajectory:
-            print("No camera trajectory available to save")
+            self.build_full_camera_trajectory_from_reconstructions()
+        if not self.full_camera_trajectory:
+            print("No camera trajectory available to save from reconstructions")
             return
         
         try:
@@ -1299,20 +1078,10 @@ class Pi3SLAMOnlineRerun:
         except:
             pass
     
-    def cleanup_disk_cache(self):
-        """Clean up disk cache files."""
-        if self.cache_dir and os.path.exists(self.cache_dir):
-            try:
-                import shutil
-                shutil.rmtree(self.cache_dir)
-                print(f"🧹 Cleaned up disk cache: {self.cache_dir}")
-            except Exception as e:
-                print(f"⚠️  Failed to clean up disk cache: {e}")
-    
     def get_statistics(self) -> Dict:
         """Get processing statistics."""
         return {
-            'total_chunks': len(self.chunk_results),
+            'total_chunks': len(self.chunk_reconstructions),
             'total_frames': len(self.timestamps)
         }
     
@@ -1334,8 +1103,8 @@ class Pi3SLAMOnlineRerun:
         print(f"   Number of common cameras: {len(common_camera_ids)}")
         
         # Print overlap indices for keypoints if available
-        if 'points_kp' in chunk_result:
-            num_keypoints = chunk_result['points_kp'].shape[1] if len(chunk_result['points_kp'].shape) > 1 else chunk_result['points_kp'].shape[0]
+        if 'points' in chunk_result:
+            num_keypoints = chunk_result['points'].shape[1] if len(chunk_result['points'].shape) > 1 else chunk_result['points'].shape[0]
             print(f"   Keypoints in current chunk: {num_keypoints}")
             
             # Calculate overlap indices based on common cameras

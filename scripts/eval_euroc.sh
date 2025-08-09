@@ -42,8 +42,8 @@ for dataset in ${datasets[@]}; do
         --cam_dist_path "$calib_file" \
         --output_path "$output_dir/calib/$dataset" \
         --save_tum \
-        --overlap 20 \
-        --chunk_length 100 \
+        --overlap 5 \
+        --chunk_length 30 \
         --conf_threshold 0.5 \
         --skip_start 1000 \
         --no_visualization

@@ -168,7 +168,6 @@ def recover_intrinsics_and_scale(result: dict, images_tensor: torch.Tensor, devi
     result["camera_poses_cw"] = torch.linalg.inv(result["camera_poses"])
     result["shift"] = shift * scale_factor
     result["intrinsics"] = intrinsics
-    result["shift"] = shift
     result["original_width"] = original_width
     result["original_height"] = original_height
 

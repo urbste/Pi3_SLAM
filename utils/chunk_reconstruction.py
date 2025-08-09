@@ -4,9 +4,14 @@ Chunk-based PyTheia reconstruction utilities for Pi3SLAM.
 
 import torch
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pytheia as pt
 from pi3.utils.camera import Camera
+import cv2
+import os
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 class ChunkPTRecon:
     """
@@ -22,6 +27,15 @@ class ChunkPTRecon:
         self.reconstruction = pt.sfm.Reconstruction()
         self.view_ids = []
         self.track_ids = []
+
+
+    # Get scale factor from first image using global MoGe model
+    def _get_scale_factor_for_pi3(self, moge_metric_depth, pi3_metric_depth, mask):
+        moge_metric_depth = moge_metric_depth[mask]
+        pi3_metric_depth = pi3_metric_depth[mask]
+        scale_factor = moge_metric_depth / pi3_metric_depth
+        scale_factor = scale_factor.median()
+        return scale_factor
     
     def set_target_size(self, original_width: int, original_height: int):
         """
@@ -30,19 +44,20 @@ class ChunkPTRecon:
         self.original_width = original_width
         self.original_height = original_height
 
-    def create_recon_from_chunk(self, chunk_data: Dict) -> pt.sfm.Reconstruction:
+    def create_recon_from_chunk(self, chunk_data: Dict, max_observations_per_track: int = 5) -> pt.sfm.Reconstruction:
         """
         Create PyTheia reconstruction from chunk data.
         
         Args:
             chunk_data: Dictionary containing:
-                - 'keypoints': Keypoint coordinates (N, num_keypoints, 2)
-                - 'colors': Keypoint colors (N, num_keypoints, 3)
-                - 'points_kp': 3D world points for keypoints (N, num_keypoints, 3)
+                - 'keypoints': Keypoint coordinates (N, num_keypoints, 2) - optional
+                - 'colors': Keypoint colors (N, num_keypoints, 3) - optional
+                - 'points_kp': 3D world points for keypoints (N, num_keypoints, 3) - optional
                 - 'camera_poses': Camera poses (N, 4, 4)
                 - 'intrinsics': Camera intrinsics (N, 3, 3) - optional
                 - 'conf_kp': Keypoint confidences (N, num_keypoints) - optional
                 - 'masks_kp': Keypoint masks (N, num_keypoints) - optional
+            max_observations_per_track: Maximum number of observations to create per track (default: 5)
         
         Returns:
             PyTheia reconstruction object
@@ -52,16 +67,48 @@ class ChunkPTRecon:
         self.view_ids = []
         self.track_ids = []
         
-        num_frames = chunk_data['keypoints'].shape[0]
-        num_keypoints = chunk_data['keypoints'].shape[1]
+        # Check if keypoints are available
+        has_keypoints = ('keypoints' in chunk_data and 
+                        'colors' in chunk_data and 
+                        'points' in chunk_data and
+                        chunk_data['keypoints'] is not None)
         
-        print(f"🔧 Creating PyTheia reconstruction from chunk: {num_frames} frames, {num_keypoints} keypoints")
+        if has_keypoints:
+            num_frames = chunk_data['keypoints'].shape[0]
+            num_keypoints = chunk_data['keypoints'].shape[1]
+            print(f"🔧 Creating PyTheia reconstruction from chunk: {num_frames} frames, {num_keypoints} keypoints")
+        else:
+            num_frames = chunk_data['camera_poses'].shape[0]
+            print(f"🔧 Creating PyTheia reconstruction from chunk: {num_frames} frames, no keypoints available")
         
+        print(f"   Max observations per track: {max_observations_per_track}")
+
+        # Debug: show view names being added
+        if 'image_paths' in chunk_data and chunk_data['image_paths']:
+            for i, path in enumerate(chunk_data['image_paths'][:3]):  # Show first 3
+                if isinstance(path, list):
+                    path = path[0] if path else f"frame_{i}"
+                import os
+                print(f"   Frame {i}: {os.path.basename(path)}")
+            if len(chunk_data['image_paths']) > 3:
+                print(f"   ... and {len(chunk_data['image_paths']) - 3} more frames")
+
         # Add cameras to reconstruction
         for frame_idx in range(num_frames):
-            # Create view
+            # Create view with actual image filename as name
+            if 'image_paths' in chunk_data and chunk_data['image_paths']:
+                # Extract filename from path
+                image_path = chunk_data['image_paths'][frame_idx]
+                if isinstance(image_path, list):
+                    # Handle case where image_paths might be nested
+                    image_path = image_path[0] if image_path else f"frame_{frame_idx}"
+                import os
+                view_name = os.path.basename(image_path)
+            else:
+                view_name = f"frame_{frame_idx}"
+            
             timestamp_ns = frame_idx
-            view_id = self.reconstruction.AddView(str(timestamp_ns), frame_idx, timestamp_ns)
+            view_id = self.reconstruction.AddView(view_name, frame_idx, timestamp_ns)
             view = self.reconstruction.MutableView(view_id)
             
             # Create camera
@@ -69,19 +116,19 @@ class ChunkPTRecon:
             
             # Use provided intrinsics or create default ones
             if 'intrinsics' in chunk_data:
-                intrinsics = chunk_data['intrinsics'][frame_idx].cpu().numpy()
+                intrinsics = chunk_data['intrinsics'][frame_idx]
             else:
                 # Create default intrinsics (principal point at center)
                 fx = fy = max(self.original_width, self.original_height)
                 cx = self.original_width / 2
                 cy = self.original_height / 2
-                intrinsics = np.array([
+                intrinsics = torch.tensor([
                     [fx, 0, cx],
                     [0, fy, cy],
                     [0, 0, 1]
                 ])
             
-            camera.create_from_intrinsics(intrinsics, self.original_width, self.original_height, 1.0)
+            camera.create_from_intrinsics(intrinsics.cpu().numpy(), self.original_width, self.original_height, 1.0)
             
             # Set camera parameters
             camera_obj = view.MutableCamera()
@@ -98,18 +145,20 @@ class ChunkPTRecon:
         # Set camera intrinsics from priors
         pt.sfm.SetCameraIntrinsicsFromPriors(self.reconstruction)
         
-        # Add tracks for each frame
+        # Add tracks for each frame (only if keypoints are available)
         for frame_idx in range(num_frames):
             # Get 3D points and colors for this frame
-            points_3d = chunk_data['points_kp'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
+            points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
             colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
             keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
-            descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
+            masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
+            #descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
 
             # Create tracks for this frame
             frame_track_ids = []
             
-            for kp_idx in range(num_keypoints):
+            for kp_idx in range(keypoints_2d.shape[0]):
+                
                 # Create track
                 track_id = self.reconstruction.AddTrack()
                 track = self.reconstruction.MutableTrack(track_id)
@@ -121,7 +170,7 @@ class ChunkPTRecon:
                 # Set color
                 track.SetColor(colors[kp_idx])
                 track.SetIsEstimated(True)
-                track.SetReferenceDescriptor(descriptors[kp_idx])
+                #track.SetReferenceDescriptor(descriptors[kp_idx])
                 
                 frame_track_ids.append(track_id)
                 
@@ -133,39 +182,272 @@ class ChunkPTRecon:
                 )
             
             # Project keypoints to ALL other frames in the chunk
-            all_other_frames = [i for i in range(num_frames) if i != frame_idx]
-            
-            if all_other_frames:
-                # Project points to all other frames
-                projected_points = self._project_points_to_other_cams(
-                    chunk_data, frame_idx, all_other_frames
-                )
-                
-                # Add observations for projected points
-                for other_frame_idx, projected_kps in zip(all_other_frames, projected_points):
-                    for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
-                        # Check if projected point is within image bounds
-                        if (0 <= projected_pt[0] < self.original_width and 
-                            0 <= projected_pt[1] < self.original_height):
-                            self.reconstruction.AddObservation(
-                                self.view_ids[other_frame_idx],
-                                track_id,
-                                pt.sfm.Feature(projected_pt)
-                            )
-            
-            self.track_ids.extend(frame_track_ids)
-        
-        print(f"✅ Created reconstruction with {len(self.view_ids)} views and {len(self.track_ids)} tracks")
+            # create an option to only project to subset of frames
+            all_frames = [i for i in range(num_frames)]
+            # find frame_idx index in all_frames
+            frame_idx_index = all_frames.index(frame_idx)
+            # now take max_observations_per_track // 2 before and after frame_idx
+            all_frames_before = all_frames[:frame_idx_index]
+            all_frames_after = all_frames[frame_idx_index + 1 : frame_idx_index + max_observations_per_track // 2 + 1]
+            all_frames = all_frames_before + all_frames_after
 
+            # Project points to all other frames
+            projected_points = self._project_points_to_other_cams(
+                chunk_data, frame_idx, all_frames
+            )
+            
+            # Add observations for projected points (with limit per track)
+            for other_frame_idx, projected_kps in zip(all_frames, projected_points):
+                for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
+                    # Check if projected point is within image bounds
+                    if (0 <= projected_pt[0] < self.original_width and 
+                        0 <= projected_pt[1] < self.original_height):
+                        
+                        # Check current number of observations for this track
+                        track = self.reconstruction.MutableTrack(track_id)
+                        
+                        # Only add observation if we haven't reached the limit
+                        self.reconstruction.AddObservation(
+                            self.view_ids[other_frame_idx],
+                            track_id,
+                            pt.sfm.Feature(projected_pt)
+                        )
+
+    
+        print(f"✅ Created reconstruction with {len(self.reconstruction.ViewIds())} views and {len(self.reconstruction.TrackIds())} tracks")
         # Bundle adjust the reconstruction
         ba_options = pt.sfm.BundleAdjustmentOptions()
         ba_options.max_num_iterations = 5
-        ba_options.verbose = True
+        ba_options.verbose = False
         ba_options.robust_loss_width = 2.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
         ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
 
+        removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)
+        print(f"   Removed {removed_tracks} tracks after initial bundle adjustment")
+
         return self.reconstruction
+    
+    def debug_projections(self, chunk_data: Dict, source_frame: int, target_frames: List[int], 
+                         save_path: Optional[str] = None, fps: int = 1) -> None:
+        """
+        Debug keypoint projections from source frame to target frames.
+        
+        This method visualizes how keypoints from a source frame are projected onto target frames,
+        which is useful for debugging the reconstruction process.
+        
+        Args:
+            chunk_data: Dictionary containing chunk data with keypoints, camera poses, and intrinsics
+            source_frame: Index of the source frame
+            target_frames: List of target frame indices to project to
+            save_path: Optional path to save the visualization as GIF (e.g., "debug_projection.gif")
+            fps: Frames per second for the GIF animation
+        """
+        print(f"🔍 Debugging keypoint projections from frame {source_frame} to frames {target_frames}")
+        import time
+        _t0 = time.time()
+        
+        # Check if keypoints are available
+        if not all(key in chunk_data for key in ['keypoints', 'points', 'camera_poses']):
+            print("❌ Missing required data for debug_projections")
+            return
+        
+        # Determine number of frames available
+        def _num_frames(x):
+            try:
+                import torch
+                if isinstance(x, torch.Tensor):
+                    return int(x.shape[0])
+            except Exception:
+                pass
+            try:
+                return len(x)
+            except Exception:
+                return 0
+
+        num_frames = _num_frames(chunk_data.get('camera_poses', []))
+
+        # Validate source and target frames against available frames
+        if not (0 <= source_frame < num_frames):
+            print(f"❌ debug_projections: source_frame {source_frame} out of range [0, {num_frames-1}] — skipping")
+            return
+
+        # Filter target_frames to valid range and exclude source_frame
+        filtered_targets = [f for f in target_frames if 0 <= f < num_frames and f != source_frame]
+        dropped = [f for f in target_frames if f not in filtered_targets]
+        if dropped:
+            print(f"⚠️  debug_projections: dropped out-of-range targets {dropped}; valid range is [0, {num_frames-1}]")
+        target_frames = filtered_targets
+        if len(target_frames) == 0:
+            print("⚠️  debug_projections: no valid target frames after filtering — skipping")
+            return
+
+        # Get source frame data
+        source_keypoints = chunk_data['keypoints'][source_frame].cpu().numpy()  # (num_keypoints, 2)
+        source_points_3d = chunk_data['points'][source_frame].cpu().numpy()  # (num_keypoints, 3)
+        
+        print(f"   Source frame {source_frame}: {len(source_keypoints)} keypoints")
+        
+        # Project points to target frames
+        _t0_proj = time.time()
+        projected_points_list = self._project_points_to_other_cams(chunk_data, source_frame, target_frames)
+        print(f"   ⏱️ projection time: {(time.time()-_t0_proj)*1000:.1f}ms for {len(target_frames)} targets")
+        
+        # Load images if available
+        images = []
+        if 'images' in chunk_data:
+            for frame_idx in [source_frame] + target_frames:
+                if frame_idx < len(chunk_data['images']):
+                    img = chunk_data['images'][frame_idx]
+                    if isinstance(img, torch.Tensor):
+                        img = img.cpu().numpy()
+                    
+                    # Convert from CHW to HWC if needed
+                    if len(img.shape) == 3 and img.shape[0] == 3:
+                        img = np.transpose(img, (1, 2, 0))
+                    
+                    # Normalize to 0-255 range if needed
+                    if img.max() <= 1.0:
+                        img = (img * 255).astype(np.uint8)
+                    
+                    images.append(img)
+                else:
+                    images.append(None)
+        else:
+            # Create blank images if no images available
+            for _ in range(len(target_frames) + 1):
+                blank_img = np.zeros((self.original_height, self.original_width, 3), dtype=np.uint8)
+                images.append(blank_img)
+        
+        # Create single plot for video-style GIF
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        # For static visualization, show side-by-side comparison
+        if not save_path or not save_path.lower().endswith('.gif'):
+            # Create side-by-side visualization for static images
+            fig, axes = plt.subplots(1, len(target_frames) + 1, figsize=(2.5 * (len(target_frames) + 1), 2.5))
+            if len(target_frames) == 0:
+                axes = [axes]
+            
+            # Plot source frame
+            ax = axes[0]
+            if images[0] is not None:
+                ax.imshow(images[0])
+            ax.scatter(source_keypoints[:, 0], source_keypoints[:, 1], c='red', s=8, alpha=0.7)
+            ax.set_title(f'Source Frame {source_frame}\n{len(source_keypoints)} keypoints', fontsize=10)
+            ax.axis('off')
+            
+            # Plot target frames with projected keypoints
+            for i, (target_frame, projected_points) in enumerate(zip(target_frames, projected_points_list)):
+                ax = axes[i + 1]
+                if images[i + 1] is not None:
+                    ax.imshow(images[i + 1])
+                
+                # Filter projected points that are within image bounds
+                valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
+                             (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
+                
+                valid_projected = projected_points[valid_mask]
+                invalid_projected = projected_points[~valid_mask]
+                
+                # Plot valid projected keypoints in green (smaller size)
+                if len(valid_projected) > 0:
+                    ax.scatter(valid_projected[:, 0], valid_projected[:, 1], c='green', s=8, alpha=0.7, label='Valid')
+                
+                # Plot invalid projected keypoints in red (outside bounds, smaller size)
+                if len(invalid_projected) > 0:
+                    ax.scatter(invalid_projected[:, 0], invalid_projected[:, 1], c='red', s=8, alpha=0.7, label='Invalid')
+                
+                ax.set_title(f'Target Frame {target_frame}\n{len(valid_projected)}/{len(projected_points)} valid', fontsize=10)
+                ax.axis('off')
+                
+                if len(valid_projected) > 0 or len(invalid_projected) > 0:
+                    ax.legend(fontsize=8)
+            
+            plt.tight_layout()
+        
+        # Save visualization if path provided
+        if save_path:
+            if save_path.lower().endswith('.gif'):
+                # Create video-style animated GIF that shows sequential frames with keypoints
+                def animate(frame_idx):
+                    ax.clear()
+                    ax.axis('off')
+                    
+                    if frame_idx == 0:
+                        # Show source frame with source keypoints
+                        if images[0] is not None:
+                            ax.imshow(images[0])
+                        ax.scatter(source_keypoints[:, 0], source_keypoints[:, 1], c='red', s=12, alpha=0.8)
+                        ax.set_title(f'Source Frame {source_frame} - Original Keypoints\n{len(source_keypoints)} keypoints', fontsize=12, pad=10)
+                    
+                    elif frame_idx <= len(target_frames):
+                        # Show target frames with projected keypoints
+                        target_idx = frame_idx - 1
+                        target_frame = target_frames[target_idx]
+                        projected_points = projected_points_list[target_idx]
+                        
+                        if images[target_idx + 1] is not None:
+                            ax.imshow(images[target_idx + 1])
+                        
+                        # Filter projected points that are within image bounds
+                        valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
+                                     (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
+                        
+                        valid_projected = projected_points[valid_mask]
+                        invalid_projected = projected_points[~valid_mask]
+                        
+                        # Plot valid projected keypoints in bright green
+                        if len(valid_projected) > 0:
+                            ax.scatter(valid_projected[:, 0], valid_projected[:, 1], c='lime', s=12, alpha=0.8, 
+                                     edgecolors='darkgreen', linewidths=0.5)
+                        
+                        # Plot invalid projected keypoints in red (outside bounds)
+                        if len(invalid_projected) > 0:
+                            ax.scatter(invalid_projected[:, 0], invalid_projected[:, 1], c='red', s=12, alpha=0.8,
+                                     edgecolors='darkred', linewidths=0.5)
+                        
+                        ax.set_title(f'Frame {target_frame} - Projected Keypoints\n{len(valid_projected)} valid, {len(invalid_projected)} invalid', 
+                                   fontsize=12, pad=10)
+                    
+                    # Set consistent axis limits
+                    ax.set_xlim(0, self.original_width)
+                    ax.set_ylim(self.original_height, 0)  # Invert y-axis for image coordinates
+                    
+                    return [ax]
+                
+                # Create animation that shows source frame + all target frames
+                total_frames = 1 + len(target_frames)  # Source frame + target frames
+                anim = animation.FuncAnimation(fig, animate, frames=total_frames, 
+                                             interval=max(500, 1000//fps), repeat=True)
+                
+                # Ensure directory exists
+                import os
+                save_dir = os.path.dirname(save_path)
+                if save_dir:  # Only create directory if path contains one
+                    os.makedirs(save_dir, exist_ok=True)
+                
+                anim.save(save_path, writer='pillow', fps=fps)
+                print(f"💾 Saved video-style projection GIF to: {save_path}")
+                plt.close(fig)  # Close figure to save memory
+            else:
+                # Save as static image
+                plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                print(f"💾 Saved debug projection image to: {save_path}")
+                plt.close(fig)  # Close figure to save memory
+        else:
+            print(f"   ⏱️ total debug projection time: {(time.time()-_t0)*1000:.1f}ms")
+            plt.show()
+        
+        # Print statistics
+        print(f"\n📊 Projection Statistics:")
+        print(f"   Source frame {source_frame}: {len(source_keypoints)} keypoints")
+        for target_frame, projected_points in zip(target_frames, projected_points_list):
+            valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
+                         (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
+            valid_count = np.sum(valid_mask)
+            total_count = len(projected_points)
+            print(f"   Target frame {target_frame}: {valid_count}/{total_count} valid projections ({100*valid_count/total_count:.1f}%)")
     
     def _project_points_to_other_cams(self, chunk_data: Dict, source_frame: int, target_frames: List[int]) -> List[np.ndarray]:
         """
@@ -185,7 +467,7 @@ class ChunkPTRecon:
         
         # Get source keypoints
         source_keypoints = chunk_data['keypoints'][source_frame]  # (num_keypoints, 2)
-        source_points_3d = chunk_data['points_kp'][source_frame]  # (num_keypoints, 3)
+        source_points_3d = chunk_data['points'][source_frame]  # (num_keypoints, 3)
         
         projected_points_list = []
         

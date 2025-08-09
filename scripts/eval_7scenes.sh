@@ -6,9 +6,8 @@ output_dir="logs/7scenes"
 groundtruth_dir="scripts/groundtruths/7scenes"
 
 # Default parameters
-overlap=${1:-20}
-chunk_length=${2:-100}
-enable_sim3_optimization=${3:-true}
+overlap=${1:-5}
+chunk_length=${2:-50}
 
 # Create output directories
 mkdir -p "$output_dir"
@@ -26,7 +25,7 @@ datasets=(
 echo "🚀 Starting 7-Scenes dataset evaluation with Pi3SLAM"
 echo "📁 Dataset path: $dataset_path"
 echo "📊 Output directory: $output_dir"
-echo "🔧 Overlap: $overlap, Chunk length: $chunk_length, SIM3 optimization: $enable_sim3_optimization"
+echo "🔧 Overlap: $overlap, Chunk length: $chunk_length"
 echo "============================================================"
 
 # Process each dataset
@@ -49,23 +48,16 @@ for dataset in ${datasets[@]}; do
     echo "🔧 Running SLAM with visualization..."
     
     # Build command with optional SIM3 optimization
-    cmd="python pi3_slam_online_rerun_modular.py \
+    cmd="python pi3_slam_online_modular.py \
         --image_dir \"$dataset_name\" \
         --output_path \"$output_dir/$dataset\" \
-        --save_tum \
         --overlap \"$overlap\" \
         --chunk_length \"$chunk_length\" \
         --conf_threshold 0.4 \
-        --rerun_port 9090 \
-        --tum_integer_timestamp"
+        --tum_integer_timestamp \
+        --save_tum \
+        --no_visualization"
     
-    # Add SIM3 optimization flag if enabled
-    if [ "$enable_sim3_optimization" = "true" ]; then
-        echo "   SIM3 optimization: ENABLED"
-    else
-        echo "   SIM3 optimization: DISABLED"
-        cmd="$cmd --no_sim3_optimization"
-    fi
     
     eval $cmd
     
