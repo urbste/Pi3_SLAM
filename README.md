@@ -1,8 +1,8 @@
 # Pi3_SLAM (Offline Mode)
 
-This repository provides an offline pipeline for chunked reconstruction using Pi3 and MoGe:
+This repository provides an offline pipeline for chunked reconstruction using [Pi3](https://github.com/yyfz/Pi3) and [MoGe](https://github.com/microsoft/MoGe):
 
-- Create chunks from an image sequence with Pi3, scale with MoGe, extract keypoints, and save per-chunk data
+- Create chunks from an image sequence with [Pi3](https://github.com/yyfz/Pi3), scale with [MoGe](https://github.com/microsoft/MoGe), extract keypoints, and save per-chunk data
 - Reconstruct and align chunks progressively to build a full scene
 - Export final point cloud (PLY) and camera trajectory in TUM format; optional per-chunk SFM/PLY
 
@@ -25,7 +25,7 @@ pip install evo --upgrade
 Assumes sequential image data.
 The offline pipeline has two steps:
 
-1) Chunk creation (Pi3 + MoGe + keypoints)
+1) Chunk creation ([Pi3](https://github.com/yyfz/Pi3) + [MoGe](https://github.com/microsoft/MoGe) + keypoints)
 ```
 python create_offline_chunks.py \
   --images /path/to/images \
@@ -90,4 +90,12 @@ Details were computed with `evo_ape tum --align-sim3` using the script’s outpu
 - The offline chunk creator reports per-chunk inference time and FPS; the reconstructor reports reconstruction FPS per chunk.
 - Chunks store keypoints, per-keypoint 3D, colors, and camera poses for efficient reconstruction.
 - `chunk_metadata.json` stores `chunk_length`, `overlap`, and `target_size`; the reconstructor auto-loads this.
+
+## Acknowledgements
+
+This work builds upon and uses ideas and code from the following projects:
+- [Pi3](https://github.com/yyfz/Pi3): Scalable permutation-equivariant visual geometry learning. We use Pi3 for chunk-wise geometry (points, local points, camera poses).
+- [MoGe](https://github.com/microsoft/MoGe): Monocular geometry with metric scale and sharp details. We use MoGe to recover metric scale for Pi3 reconstructions.
+
+Please refer to their repositories for more details and cite them when appropriate.
 
