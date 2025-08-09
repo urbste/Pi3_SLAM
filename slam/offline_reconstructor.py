@@ -141,6 +141,20 @@ class OfflineReconstructor:
             except Exception as e:
                 print(f"❌ Failed to save final PLY: {e}")
 
+            # Camera trajectory as PLY
+            try:
+                cam_positions, _, _ = self._extract_camera_positions_from_reconstructions()
+                if cam_positions:
+                    cam_pts = np.asarray(cam_positions, dtype=np.float32)
+                    cam_cols = np.full((len(cam_pts), 3), [1.0, 0.0, 0.0], dtype=np.float32)
+                    cam_ply_path = os.path.join(self.output_dir, 'final_camera_poses.ply')
+                    write_ply(torch.from_numpy(cam_pts), torch.from_numpy(cam_cols), cam_ply_path)
+                    print(f"✅ Final camera trajectory PLY saved: {cam_ply_path}")
+                else:
+                    print("⚠️ No camera poses extracted; skipping trajectory PLY")
+            except Exception as e:
+                print(f"❌ Failed to save camera trajectory PLY: {e}")
+
             # TUM trajectory (integer timestamps)
             try:
                 tum_path = os.path.join(self.output_dir, 'trajectory_tum.txt')
