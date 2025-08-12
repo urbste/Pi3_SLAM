@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--overlap", type=int, default=None)
     parser.add_argument("--max-observations-per-track", type=int, default=5)
     parser.add_argument("--save-per-chunk", action="store_true", help="Save per-chunk .sfm/.ply files as well")
+    parser.add_argument("--use-inverse-depth", action="store_true", help="Use inverse depth parametrization")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -34,6 +35,7 @@ def main():
         overlap=args.overlap,
         max_observations_per_track=args.max_observations_per_track,
         save_per_chunk=args.save_per_chunk,
+        use_inverse_depth=args.use_inverse_depth,
     )
     recon.run()
 

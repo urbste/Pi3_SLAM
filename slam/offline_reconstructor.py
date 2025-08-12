@@ -22,7 +22,9 @@ from utils.reconstruction_alignment import create_view_graph_matches, align_and_
 
 
 class OfflineReconstructor:
-    def __init__(self, chunk_dir: str, output_dir: str, chunk_length: Optional[int] = None, overlap: Optional[int] = None, max_observations_per_track: int = 5, save_per_chunk: bool = False):
+    def __init__(self, chunk_dir: str, output_dir: str, chunk_length: Optional[int] = None, 
+                 overlap: Optional[int] = None, max_observations_per_track: int = 5, save_per_chunk: bool = False,
+                 use_inverse_depth: bool = False):
         self.chunk_dir = chunk_dir
         self.output_dir = output_dir
 
@@ -44,6 +46,7 @@ class OfflineReconstructor:
         self.overlap = int(overlap) if overlap is not None else (loaded_overlap or 10)
         self.max_observations_per_track = max_observations_per_track
         self.save_per_chunk = save_per_chunk
+        self.use_inverse_depth = use_inverse_depth
 
         os.makedirs(self.output_dir, exist_ok=True)
         self.recon_dir = os.path.join(self.output_dir, 'reconstructions')
@@ -69,7 +72,9 @@ class OfflineReconstructor:
             chunk['intrinsics'] = chunk['camera_params'].get('intrinsics', None)
 
         # Build reconstruction
-        recon = self.reconstructor.create_recon_from_chunk(chunk, max_observations_per_track=self.max_observations_per_track)
+        recon = self.reconstructor.create_recon_from_chunk(chunk, 
+            max_observations_per_track=self.max_observations_per_track,
+            use_inverse_depth=self.use_inverse_depth)
         return recon
 
     def _save_chunk_reconstruction(self, recon: pt.sfm.Reconstruction, idx: int) -> None:

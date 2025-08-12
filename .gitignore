@@ -17,3 +17,5 @@ __pycache__
 output/
 
 *.sfm
+
+ba_results/

@@ -24,6 +24,7 @@ class ChunkPTRecon:
         self.reconstruction = pt.sfm.Reconstruction()
         self.view_ids = []
         self.track_ids = []
+        self.use_inverse_depth = False
 
     def set_target_size(self, original_width: int, original_height: int):
         """
@@ -32,7 +33,7 @@ class ChunkPTRecon:
         self.original_width = original_width
         self.original_height = original_height
 
-    def create_recon_from_chunk(self, chunk_data: Dict, max_observations_per_track: int = 5) -> pt.sfm.Reconstruction:
+    def create_recon_from_chunk(self, chunk_data: Dict, max_observations_per_track: int = 5, use_inverse_depth: bool = False) -> pt.sfm.Reconstruction:
         """
         Create PyTheia reconstruction from chunk data.
         
@@ -54,6 +55,7 @@ class ChunkPTRecon:
         self.reconstruction = pt.sfm.Reconstruction()
         self.view_ids = []
         self.track_ids = []
+        self.use_inverse_depth = use_inverse_depth
         
         # Check if keypoints are available
         has_keypoints = ('keypoints' in chunk_data and 
@@ -182,15 +184,36 @@ class ChunkPTRecon:
                                 pt.sfm.Feature(projected_pt)
                             )
 
-    
+        if self.use_inverse_depth:
+            self.reconstruction.InitializeInverseDepth()
+
         print(f"✅ Created reconstruction with {len(self.reconstruction.ViewIds())} views and {len(self.reconstruction.TrackIds())} tracks")
         # Bundle adjust the reconstruction
         ba_options = pt.sfm.BundleAdjustmentOptions()
-        ba_options.max_num_iterations = 5
+        ba_options.max_num_iterations = 10
+        ba_options.use_inner_iterations = False
+        ba_options.use_mixed_precision_solves = True
+        ba_options.max_num_refinement_iterations = 1
+        ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
+        ba_options.preconditioner_type = pt.sfm.PreconditionerType.IDENTITY
+        ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
+        if self.use_inverse_depth:
+            ba_options.use_homogeneous_point_parametrization = False
+            ba_options.use_inverse_depth_parametrization = True
+        else:
+            ba_options.use_homogeneous_point_parametrization = True
+            ba_options.use_inverse_depth_parametrization = False
         ba_options.verbose = False
         ba_options.robust_loss_width = 2.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
         ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
+
+        # # Perform a second BA to refine the inverse depth
+        # if self.use_inverse_depth:
+        #     ba_options.use_homogeneous_point_parametrization = True
+        #     ba_options.use_inverse_depth_parametrization = False
+        #     ba_options.max_num_iterations = 2
+        #     ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
 
         removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(
             set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)

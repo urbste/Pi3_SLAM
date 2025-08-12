@@ -6,8 +6,8 @@ output_dir="logs/7scenes"
 groundtruth_dir="scripts/groundtruths/7scenes"
 
 # Default parameters
-overlap=${1:-10}
-chunk_length=${2:-100}
+overlap=${1:-5}
+chunk_length=${2:-50}
 
 # Create output directories
 mkdir -p "$output_dir"
@@ -58,15 +58,16 @@ for dataset in ${datasets[@]}; do
         --device cuda \
         --metric-depth \
         --keypoints grid \
-        --max-kp 100 \
+        --max-kp 250 \
         --estimate-intrinsics \
-        --num-workers 2
+        --num-workers 2 
 
     echo "🏗️  Reconstructing from chunks..."
     python reconstruct_offline.py \
         --chunks "$chunks_out" \
         --output "$recon_out" \
-        --max-observations-per-track 6
+        --max-observations-per-track 7 \
+        --use-inverse-depth
 
     echo "✅ Completed processing for $dataset"
 done
