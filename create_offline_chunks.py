@@ -18,7 +18,11 @@ import os
 from typing import List
 
 from slam.offline_chunk_creator import OfflineChunkCreator, OfflineCreatorConfig
+import torch
+torch.set_float32_matmul_precision('high')
 
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1" 
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/home/steffen/.torchinductor_cache"
 
 def list_images(root: str) -> List[str]:
     exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
@@ -44,6 +48,7 @@ def main():
     parser.add_argument("--chunk-length", type=int, default=50)
     parser.add_argument("--overlap", type=int, default=5)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--cam-dist-path", type=str, default=None, help="Path to camera calibration file for undistortion")
     parser.add_argument("--metric-depth", action="store_true", help="Enable MoGe metric scaling")
     parser.add_argument("--no-metric-depth", dest="metric_depth", action="store_false")
     parser.set_defaults(metric_depth=True)
@@ -70,6 +75,7 @@ def main():
         keypoint_detection_threshold=args.kp_threshold,
         estimate_camera_params=args.estimate_intrinsics,
         num_loader_workers=args.num_workers,
+        cam_dist_path=args.cam_dist_path,
     )
 
     creator = OfflineChunkCreator(cfg)

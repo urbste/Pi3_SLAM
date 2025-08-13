@@ -27,6 +27,7 @@ from pi3.models.pi3 import Pi3
 from pi3.utils.geometry import depth_edge
 
 from utils.image_utils import calculate_target_size
+from utils.undistortion_utils import create_undistortion_maps
 from utils.keypoint_extraction import create_keypoint_extractor
 from utils.camera_estimation import estimate_camera_parameters_single_chunk, print_camera_parameters_summary
 from datasets.image_datasets import ChunkImageDataset
@@ -46,6 +47,7 @@ class OfflineCreatorConfig:
     estimate_camera_params: bool = True
     num_loader_workers: int = 2
     pin_memory: bool = True
+    cam_dist_path: Optional[str] = None
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -93,6 +95,21 @@ class OfflineChunkCreator:
 
         # Internal state
         self.target_size: Optional[Tuple[int, int]] = None  # (H, W)
+        # Undistortion maps (optional)
+        self.undistortion_maps = None
+        if getattr(self.config, 'cam_dist_path', None):
+            try:
+                if os.path.exists(self.config.cam_dist_path):
+                    print(f"🔧 Creating undistortion maps from: {self.config.cam_dist_path}")
+                    self.undistortion_maps = create_undistortion_maps(self.config.cam_dist_path)
+                    if self.undistortion_maps is not None:
+                        print("✅ Undistortion maps ready; images will be undistorted before Pi3 inference")
+                    else:
+                        print("⚠️  Failed to create undistortion maps; proceeding without undistortion")
+                else:
+                    print(f"⚠️  Calibration file not found: {self.config.cam_dist_path}")
+            except Exception as e:
+                print(f"⚠️  Undistortion map creation failed: {e}")
 
     @staticmethod
     def _compute_masks(pi3_result: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -256,7 +273,7 @@ class OfflineChunkCreator:
             overlap=self.config.overlap,
             target_size=self.target_size,
             device='cpu',
-            undistortion_maps=None,
+            undistortion_maps=self.undistortion_maps,
         )
 
         loader = DataLoader(

@@ -7,7 +7,7 @@ groundtruth_dir="scripts/groundtruths/7scenes"
 
 # Default parameters
 overlap=${1:-5}
-chunk_length=${2:-50}
+chunk_length=${2:-30}
 
 # Create output directories
 mkdir -p "$output_dir"
@@ -58,7 +58,7 @@ for dataset in ${datasets[@]}; do
         --device cuda \
         --metric-depth \
         --keypoints grid \
-        --max-kp 250 \
+        --max-kp 200 \
         --estimate-intrinsics \
         --num-workers 2 
 
@@ -66,8 +66,7 @@ for dataset in ${datasets[@]}; do
     python reconstruct_offline.py \
         --chunks "$chunks_out" \
         --output "$recon_out" \
-        --max-observations-per-track 7 \
-        --use-inverse-depth
+        --max-observations-per-track 7
 
     echo "✅ Completed processing for $dataset"
 done
@@ -92,7 +91,9 @@ for dataset in ${datasets[@]}; do
     
     if [ -f "$traj_file" ]; then
         echo "📊 Evaluating trajectory..."
-        evo_ape tum "$groundtruth_dir/$dataset.txt" "$traj_file" -as
+        plot_out="$output_dir/$dataset/reconstruction/evo_ape.png"
+        evo_ape tum "$groundtruth_dir/$dataset.txt" "$traj_file" -as --plot --plot_mode xyz --save_plot "$plot_out"
+        echo "🖼️  Saved APE plot to: $plot_out"
     else
         echo "⚠️  Trajectory file not found: $traj_file"
     fi
