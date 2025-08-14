@@ -176,6 +176,30 @@ class Pi3SLAMViserVisualizer:
                 self.follow_distance = float(self.gui_controls["follow_distance"].value)
                 self.follow_height = float(self.gui_controls["follow_height"].value)
 
+        with self.server.gui.add_folder("🖼️ Images"):
+            self.gui_controls["show_latest_image"] = self.server.gui.add_checkbox(
+                "Show Latest Frame", initial_value=True
+            )
+            self.gui_controls["show_chunk_start_image"] = self.server.gui.add_checkbox(
+                "Show Chunk Start Frame", initial_value=False
+            )
+            self.gui_controls["show_chunk_end_image"] = self.server.gui.add_checkbox(
+                "Show Chunk End Frame", initial_value=False
+            )
+            # Create image widget placeholders; we'll update their values with numpy arrays
+            try:
+                self.gui_controls["latest_image_widget"] = self.server.gui.add_image("Latest Frame")
+            except Exception:
+                self.gui_controls["latest_image_widget"] = None
+            try:
+                self.gui_controls["chunk_start_image_widget"] = self.server.gui.add_image("Chunk Start Frame")
+            except Exception:
+                self.gui_controls["chunk_start_image_widget"] = None
+            try:
+                self.gui_controls["chunk_end_image_widget"] = self.server.gui.add_image("Chunk End Frame")
+            except Exception:
+                self.gui_controls["chunk_end_image_widget"] = None
+
         @self.server.on_client_connect
         def _on_connect(client: "viser.ClientHandle") -> None:
             try:
@@ -219,6 +243,12 @@ class Pi3SLAMViserVisualizer:
 
     def _update_visualization(self, slam_data: Dict[str, Any]):
         """Update the 3D visualization with new SLAM data."""
+        # Support split point clouds: current vs history; fallback to combined
+        current_points = slam_data.get("current_points", np.array([]))
+        current_colors = slam_data.get("current_colors", np.array([]))
+        history_points = slam_data.get("history_points", np.array([]))
+        history_colors = slam_data.get("history_colors", np.array([]))
+        # Legacy combined keys
         points = slam_data.get("points", np.array([]))
         colors = slam_data.get("colors", np.array([]))
         camera_positions = slam_data.get("camera_positions", np.array([]))
@@ -231,14 +261,44 @@ class Pi3SLAMViserVisualizer:
         self.point_size = self.gui_controls["point_size"].value
         self.camera_size = self.gui_controls["camera_size"].value
 
-        if self.show_point_cloud and len(points) > 0:
-            self._update_point_cloud(points, colors)
+        # Handle point cloud visibility and updates
+        if self.show_point_cloud:
+            # If split layers present, render both; otherwise render legacy combined layer
+            if len(current_points) > 0 or len(history_points) > 0:
+                self._update_point_cloud_layer("points_history", history_points, history_colors)
+                self._update_point_cloud_layer("points_current", current_points, current_colors)
+                self.total_points = int((len(history_points) if isinstance(history_points, np.ndarray) else 0) +
+                                        (len(current_points) if isinstance(current_points, np.ndarray) else 0))
+            elif len(points) > 0:
+                self._update_point_cloud_layer("slam_trajectory", points, colors)
+                self.total_points = len(points)
+        else:
+            # Remove point cloud layers when toggled off
+            for name in ("points_history", "points_current", "slam_trajectory"):
+                try:
+                    self.server.scene.remove(name)
+                except Exception:
+                    pass
+            self.total_points = 0
+
         if self.show_trajectory and len(camera_positions) > 0:
             self._update_camera_trajectory(camera_positions)
+        else:
+            try:
+                self.server.scene.remove("camera_trajectory")
+            except Exception:
+                pass
+
         if self.show_cameras and len(camera_positions) > 0:
             self._update_camera_poses(camera_positions, camera_orientations)
-        if len(chunk_poses) > 1:
-            self._update_chunk_waypoints(chunk_poses)
+        else:
+            # Remove previously drawn camera frustums/spheres
+            for i in range(self.total_cameras):
+                try:
+                    self.server.scene.remove(f"camera_{i}")
+                except Exception:
+                    pass
+            self.total_cameras = 0
 
         self._update_statistics(slam_data)
 
@@ -261,29 +321,108 @@ class Pi3SLAMViserVisualizer:
                 pass
             self._apply_follow_camera(self._latest_cam_pos, self._latest_cam_forward)
 
-    def _update_point_cloud(self, points: np.ndarray, colors: np.ndarray):
-        if len(points) == 0:
-            return
+        # Update image panels if available
+        try:
+            show_img = self.gui_controls.get("show_latest_image").value if self.gui_controls.get("show_latest_image") else True
+            img_widget = self.gui_controls.get("latest_image_widget")
+        except Exception:
+            show_img = True
+            img_widget = None
 
-        if len(points) > self.max_points:
-            step = max(1, len(points) // self.max_points)
-            indices = np.arange(0, len(points), step)[: self.max_points]
-            display_points = points[indices]
-            display_colors = colors[indices]
-        else:
+        if show_img and img_widget is not None:
+            current_frame = slam_data.get("current_frame", None)
+            current_kps = slam_data.get("current_keypoints", None)
+            if isinstance(current_frame, np.ndarray) and current_frame.size > 0:
+                try:
+                    frame_to_show = render_keypoints_on_image(current_frame, current_kps) if isinstance(current_kps, np.ndarray) and current_kps.size > 0 else current_frame
+                except Exception:
+                    frame_to_show = current_frame
+                try:
+                    img_widget.value = frame_to_show
+                except Exception:
+                    try:
+                        self.server.add_image(frame_to_show, label="Latest Frame")
+                    except Exception:
+                        pass
+
+        # Chunk start image
+        try:
+            show_start = self.gui_controls.get("show_chunk_start_image").value if self.gui_controls.get("show_chunk_start_image") else False
+            start_widget = self.gui_controls.get("chunk_start_image_widget")
+        except Exception:
+            show_start = False
+            start_widget = None
+
+        if show_start and start_widget is not None:
+            start_frame = slam_data.get("chunk_start_frame", None)
+            start_kps = slam_data.get("chunk_start_keypoints", None)
+            if isinstance(start_frame, np.ndarray) and start_frame.size > 0:
+                try:
+                    frame_to_show = render_keypoints_on_image(start_frame, start_kps) if isinstance(start_kps, np.ndarray) and start_kps.size > 0 else start_frame
+                except Exception:
+                    frame_to_show = start_frame
+                try:
+                    start_widget.value = frame_to_show
+                except Exception:
+                    try:
+                        self.server.add_image(frame_to_show, label="Chunk Start Frame")
+                    except Exception:
+                        pass
+
+        # Chunk end image
+        try:
+            show_end = self.gui_controls.get("show_chunk_end_image").value if self.gui_controls.get("show_chunk_end_image") else False
+            end_widget = self.gui_controls.get("chunk_end_image_widget")
+        except Exception:
+            show_end = False
+            end_widget = None
+
+        if show_end and end_widget is not None:
+            end_frame = slam_data.get("chunk_end_frame", None)
+            end_kps = slam_data.get("chunk_end_keypoints", None)
+            if isinstance(end_frame, np.ndarray) and end_frame.size > 0:
+                try:
+                    frame_to_show = render_keypoints_on_image(end_frame, end_kps) if isinstance(end_kps, np.ndarray) and end_kps.size > 0 else end_frame
+                except Exception:
+                    frame_to_show = end_frame
+                try:
+                    end_widget.value = frame_to_show
+                except Exception:
+                    try:
+                        self.server.add_image(frame_to_show, label="Chunk End Frame")
+                    except Exception:
+                        pass
+
+    def _update_point_cloud_layer(self, name: str, points: np.ndarray, colors: np.ndarray):
+        """Update or add a named point cloud layer with appropriate downsampling and color normalization."""
+        try:
+            if points is None or len(points) == 0:
+                # If empty, remove layer if present
+                try:
+                    self.server.scene.remove(name)
+                except Exception:
+                    pass
+                return
+
             display_points = points
             display_colors = colors
+            if len(display_points) > self.max_points:
+                step = max(1, len(display_points) // self.max_points)
+                indices = np.arange(0, len(display_points), step)[: self.max_points]
+                display_points = display_points[indices]
+                display_colors = display_colors[indices] if display_colors is not None and display_colors.size > 0 else display_colors
 
-        if display_colors.size > 0 and display_colors.max() > 1.0:
-            display_colors = display_colors.astype(np.float32) / 255.0
+            if display_colors is not None and display_colors.size > 0 and display_colors.max() > 1.0:
+                display_colors = display_colors.astype(np.float32) / 255.0
 
-        self.server.scene.add_point_cloud(
-            name="slam_trajectory",
-            points=display_points.astype(np.float32),
-            colors=display_colors.astype(np.float32),
-            point_size=self.point_size,
-        )
-        self.total_points = len(display_points)
+            self.server.scene.add_point_cloud(
+                name=name,
+                points=display_points.astype(np.float32),
+                colors=(display_colors.astype(np.float32) if display_colors is not None and display_colors.size > 0 else None),
+                point_size=self.point_size,
+            )
+        except Exception as e:
+            print(f"⚠️  Failed to update point cloud layer {name}: {e}")
 
     def _update_camera_trajectory(self, camera_positions: np.ndarray):
         if len(camera_positions) < 2:
@@ -430,10 +569,10 @@ def start_viser_visualization_process(data_queue: mp.Queue, port: int = 8080, ma
     visualizer.start_visualization_server(data_queue)
 
 
-def visualization_process(queue: mp.Queue, rerun_port: int, max_points: int = 200000, update_interval: float = 0.1):
-    """Legacy wrapper mapping old Rerun interface to Viser visualization."""
+def visualization_process(queue: mp.Queue, port: int, max_points: int = 200000, update_interval: float = 0.1):
+    """Start visualization process (Viser) or console-mode fallback when Viser is unavailable."""
     if VISER_AVAILABLE:
-        start_viser_visualization_process(queue, port=rerun_port, max_points=max_points)
+        start_viser_visualization_process(queue, port=port, max_points=max_points)
     else:
         print("🎥 Visualization process started (console mode)")
         while True:
@@ -455,5 +594,6 @@ def visualization_process(queue: mp.Queue, rerun_port: int, max_points: int = 20
 
 
 def draw_keypoints_on_image(image: np.ndarray, keypoints: np.ndarray, radius: int = 3, thickness: int = 2) -> np.ndarray:
-    """Legacy compatibility function for drawing keypoints."""
+    """Convenience wrapper for drawing keypoints (red)."""
     return render_keypoints_on_image(image, keypoints, radius, thickness, (0, 0, 255))
+

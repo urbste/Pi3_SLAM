@@ -65,7 +65,7 @@ Use the provided script to run the offline pipeline on 7-Scenes and evaluate wit
 bash scripts/eval_7scenes.sh [overlap] [chunk_length]
 ```
 
-Defaults inside the script: overlap=10, chunk_length=100. The script will:
+Defaults inside the script: overlap=20, chunk_length=100. The script will:
 - Create chunks for each scene
 - Reconstruct the scene
 - Write `trajectory_tum.txt` and evaluate APE (Sim3 alignment) against ground truth
@@ -73,14 +73,16 @@ Defaults inside the script: overlap=10, chunk_length=100. The script will:
 ### Results (APE, RMSE in meters)
 
 | Scene       | RMSE |
-|-------------|-----:|
-| chess       | 0.078 |
-| fire        | 0.043 |
-| heads       | 0.065 |
-| office      | 0.147 |
-| pumpkin     | 0.360 |
-| redkitchen  | 0.043 |
-| stairs      | 0.091 |
+|-------------|------:|
+| chess       | 0.032 |
+| fire        | 0.062 |
+| heads       | 0.046 |
+| office      | 0.099 |
+| pumpkin     | 0.153 |
+| redkitchen  | 0.032 |
+| stairs      | 0.062 |
+
+** Mean: 0.069 **
 
 Details were computed with `evo_ape tum --align-sim3` using the script’s outputs.
 
@@ -99,3 +101,9 @@ This work builds upon and uses ideas and code from the following projects:
 
 Please refer to their repositories for more details and cite them when appropriate.
 
+## TODO
+
+ - [ ] Add correlation based features refinement
+ - [ ] Add localization and reconstruction of another camera
+ - [ ] Add gravity residuals
+ - [ ] Add GPS residuals

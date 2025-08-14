@@ -57,11 +57,24 @@ def main():
     parser.add_argument("--kp-threshold", type=float, default=0.005)
     parser.add_argument("--estimate-intrinsics", action="store_true", default=True)
     parser.add_argument("--num-workers", type=int, default=4)
+    # Optional frame range controls (consistent with online CLI)
+    parser.add_argument("--skip-start", type=int, default=0, help="Number of frames to skip from the beginning")
+    parser.add_argument("--skip-end", type=int, default=0, help="Number of frames to skip from the end")
     args = parser.parse_args()
 
     image_paths = list_images(args.images)
     if not image_paths:
         raise SystemExit(f"No images found for: {args.images}")
+
+    # Apply frame skipping
+    total_images = len(image_paths)
+    effective_start = max(0, int(args.skip_start))
+    effective_end = total_images - max(0, int(args.skip_end))
+    if effective_start >= total_images:
+        raise SystemExit(f"Invalid --skip-start {args.skip_start}: exceeds total images {total_images}")
+    if effective_end <= effective_start:
+        raise SystemExit(f"Invalid frame range after skipping: start {effective_start}, end {effective_end}")
+    image_paths = image_paths[effective_start:effective_end]
 
     cfg = OfflineCreatorConfig(
         model_path=args.model_path,

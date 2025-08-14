@@ -27,7 +27,7 @@ from utils.reconstruction_alignment import (
 from utils.telemetry_converter import TelemetryImporter
 import pytheia as pt
 from datasets.image_datasets import ChunkImageDataset
-from visualization.rerun_visualizer import visualization_process
+from visualization.visualizer import visualization_process
 
 
 def _inference_worker(
@@ -242,7 +242,8 @@ class Pi3SLAMOnline:
                  save_chunk_reconstructions: bool = False,
                   max_observations_per_track: int = 5, do_metric_depth: bool = False,
                   save_debug_projections: bool = False,
-                  model_path: Optional[str] = None):
+                  model_path: Optional[str] = None,
+                  use_inverse_depth: bool = False):
         """
         Initialize Pi3SLAM Online with visualization.
         
@@ -280,6 +281,7 @@ class Pi3SLAMOnline:
         self.save_debug_projections = save_debug_projections
         self.model_path = model_path
         self.keypoint_detection_threshold = keypoint_detection_threshold
+        self.use_inverse_depth = use_inverse_depth
         # Initialize keypoint extractor if enabled
         self.keypoint_extractor = None
         if self.keypoint_type != 'none':
@@ -339,6 +341,10 @@ class Pi3SLAMOnline:
         self.max_points_visualization = 50000
         self.update_interval = 0.1
         self.visualization_subsample_ratio = 0.1
+        # Visualization mixing controls (keep current chunk dense, history sparse)
+        self.history_subsample_ratio = 0.02
+        self.max_history_points_visualization = 20000
+        self.max_current_points_visualization = 80000
         
         # Timing statistics
         self.timing_stats: Dict[str, Dict[str, float]] = {}
@@ -365,7 +371,8 @@ class Pi3SLAMOnline:
         if self.do_metric_depth:
             print("   Loading MoGe model...")
             from moge.model.v2 import MoGeModel
-            self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to("cuda").eval()
+            # Match offline chunk creator variant for consistency
+            self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vits-normal").to("cuda").eval()
 
         print(f"🚀 Pi3SLAM Online initialized with chunk_length={chunk_length}, overlap={overlap}")
         print(f"   Device: {device}, Confidence threshold: {conf_threshold}")
@@ -461,6 +468,51 @@ class Pi3SLAMOnline:
         if colors_arr.size > 0 and colors_arr.max() > 1.0:
             colors_arr = colors_arr / 255.0
         return points_arr, colors_arr
+
+    def _extract_points_colors_split_latest(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract points/colors split into latest reconstruction and history reconstructions.
+
+        Returns:
+            latest_points, latest_colors, history_points, history_colors
+        """
+        if not self.chunk_reconstructions:
+            return np.array([]), np.array([]), np.array([]), np.array([])
+
+        latest_points_list: List[np.ndarray] = []
+        latest_colors_list: List[np.ndarray] = []
+        history_points_list: List[np.ndarray] = []
+        history_colors_list: List[np.ndarray] = []
+
+        for idx, recon in enumerate(self.chunk_reconstructions):
+            if recon is None:
+                continue
+            for track_id in recon.TrackIds():
+                track = recon.Track(track_id)
+                p = track.Point()
+                p3 = np.array(p[:3]/p[3], dtype=np.float32)
+                c = np.array(track.Color(), dtype=np.float32)
+                if idx == len(self.chunk_reconstructions) - 1:
+                    latest_points_list.append(p3)
+                    latest_colors_list.append(c)
+                else:
+                    history_points_list.append(p3)
+                    history_colors_list.append(c)
+
+        if not latest_points_list and not history_points_list:
+            return np.array([]), np.array([]), np.array([]), np.array([])
+
+        latest_points = np.asarray(latest_points_list, dtype=np.float32) if latest_points_list else np.array([])
+        latest_colors = np.asarray(latest_colors_list, dtype=np.float32) if latest_colors_list else np.array([])
+        history_points = np.asarray(history_points_list, dtype=np.float32) if history_points_list else np.array([])
+        history_colors = np.asarray(history_colors_list, dtype=np.float32) if history_colors_list else np.array([])
+
+        # Normalize colors if needed
+        if latest_colors.size > 0 and latest_colors.max() > 1.0:
+            latest_colors = latest_colors / 255.0
+        if history_colors.size > 0 and history_colors.max() > 1.0:
+            history_colors = history_colors / 255.0
+
+        return latest_points, latest_colors, history_points, history_colors
 
     def _extract_camera_positions_from_reconstructions(self, latest_only: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """Collect camera positions and orientations from PyTheia reconstructions.
@@ -603,7 +655,7 @@ class Pi3SLAMOnline:
             self.loader_running = False
     
     def start_visualization(self):
-        """Start the Rerun visualization in a separate process."""
+        """Start the Viser visualization in a separate process."""
         if self.vis_running:
             return
         
@@ -619,7 +671,7 @@ class Pi3SLAMOnline:
             self.vis_process.start()
             self.vis_running = True
             
-            print(f"🎥 Rerun visualization process started on port {self.visualization_port}")
+            print(f"🎥 Viser visualization process started on port {self.visualization_port}")
             print(f"🌐 Open http://localhost:{self.visualization_port} in your browser to view the visualization")
             
         except Exception as e:
@@ -628,7 +680,7 @@ class Pi3SLAMOnline:
             self.vis_running = False
     
     def stop_visualization(self):
-        """Stop the Rerun visualization process."""
+        """Stop the visualization process."""
         if self.vis_running and self.vis_process is not None:
             try:
                 # Send shutdown signal
@@ -644,7 +696,7 @@ class Pi3SLAMOnline:
                     self.vis_process.join(timeout=2.0)
                 
                 self.vis_running = False
-                print("🎥 Rerun visualization process stopped")
+                print("🎥 Visualization process stopped")
                 
             except Exception as e:
                 print(f"⚠️  Error stopping visualization process: {e}")
@@ -961,7 +1013,9 @@ class Pi3SLAMOnline:
         # Create reconstruction
         _t0_recon = time.time()
         chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(
-            cpu_result, max_observations_per_track=self.max_observations_per_track
+            cpu_result,
+            max_observations_per_track=self.max_observations_per_track,
+            use_inverse_depth=self.use_inverse_depth,
         )
         dt_recon = time.time() - _t0_recon
         self._record_timing("create_reconstruction", dt_recon)
@@ -1176,7 +1230,10 @@ class Pi3SLAMOnline:
         # Create reconstruction
         _t0_recon = time.time()
         chunk_reconstruction = self.chunk_reconstructor.create_recon_from_chunk(
-            cpu_result, max_observations_per_track = self.max_observations_per_track)
+            cpu_result,
+            max_observations_per_track=self.max_observations_per_track,
+            use_inverse_depth=self.use_inverse_depth,
+        )
         self._record_timing("create_reconstruction", time.time() - _t0_recon)
 
         if self.save_debug_projections:
@@ -1442,16 +1499,49 @@ class Pi3SLAMOnline:
         self._last_viz_update = current_time
         
         try:
-            # Use aligned data if provided, otherwise fall back to reconstruction data
+            # Compose visualization: dense current chunk + heavily downsampled history
             if aligned_chunk_data is not None and aligned_chunk_data.get('points') is not None:
-                # Use the aligned data directly from the alignment process
-                all_points = aligned_chunk_data['points']
-                all_colors = aligned_chunk_data['colors']
+                # Latest from aligned data
+                latest_points = aligned_chunk_data['points']
+                latest_colors = aligned_chunk_data['colors']
                 camera_positions = aligned_chunk_data['camera_poses']
                 camera_orientations = aligned_chunk_data.get('camera_orientations', np.array([]))
+                # History from previous reconstructions
+                _, _, history_points, history_colors = self._extract_points_colors_split_latest()
             else:
-                all_points, all_colors = self._get_visualization_points()
+                latest_points, latest_colors, history_points, history_colors = self._extract_points_colors_split_latest()
                 camera_positions, camera_orientations = self._extract_camera_positions_from_reconstructions(latest_only=True)
+
+            # Subsample history strongly to keep visualization responsive
+            if history_points.size > 0:
+                target_hist = min(self.max_history_points_visualization, int(max(1000, len(history_points) * self.history_subsample_ratio)))
+                if len(history_points) > target_hist:
+                    hist_idx = np.random.choice(len(history_points), target_hist, replace=False)
+                    history_points = history_points[hist_idx]
+                    history_colors = history_colors[hist_idx] if history_colors.size > 0 else history_colors
+            # Optionally cap current chunk points to avoid spikes
+            if latest_points.size > 0 and len(latest_points) > self.max_current_points_visualization:
+                cur_idx = np.random.choice(len(latest_points), self.max_current_points_visualization, replace=False)
+                latest_points = latest_points[cur_idx]
+                latest_colors = latest_colors[cur_idx] if latest_colors.size > 0 else latest_colors
+
+            # Combined fallback for legacy visualizer path
+            if latest_points.size > 0 or history_points.size > 0:
+                if latest_points.size > 0 and history_points.size > 0:
+                    all_points = np.concatenate([history_points, latest_points], axis=0)
+                    if (latest_colors.size > 0) and (history_colors.size > 0):
+                        all_colors = np.concatenate([history_colors, latest_colors], axis=0)
+                    else:
+                        all_colors = latest_colors if latest_colors.size > 0 else history_colors
+                elif latest_points.size > 0:
+                    all_points = latest_points
+                    all_colors = latest_colors
+                else:
+                    all_points = history_points
+                    all_colors = history_colors
+            else:
+                all_points = np.array([])
+                all_colors = np.array([])
             
             # Get current frame and chunk frames
             current_frame = None
@@ -1518,6 +1608,11 @@ class Pi3SLAMOnline:
                 'current_keypoints': current_keypoints,
                 'chunk_start_keypoints': chunk_start_keypoints,
                 'chunk_end_keypoints': chunk_end_keypoints,
+                # Provide split layers for the visualizer to render separately if supported
+                'current_points': latest_points,
+                'current_colors': latest_colors,
+                'history_points': history_points,
+                'history_colors': history_colors,
             }
             
             # Non-blocking put to avoid blocking the main process

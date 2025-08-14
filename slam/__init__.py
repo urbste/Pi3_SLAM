@@ -2,8 +2,12 @@
 Model modules for Pi3SLAM.
 """
 
-from .pi3_slam_online import *
+from .online_reconstructor import *
+from .offline_chunk_creator import *
+from .offline_reconstructor import *
 
 __all__ = [
-    'Pi3SLAMOnlineRerun',
+    'Pi3SLAMOnline',
+    'OfflineChunkCreator',
+    'OfflineReconstructor',
 ] 

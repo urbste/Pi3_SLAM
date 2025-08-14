@@ -8,7 +8,7 @@ import os
 from typing import List
 
 from pi3.models.pi3 import Pi3
-from slam.pi3_slam_online import Pi3SLAMOnline
+from slam import Pi3SLAMOnline
 from utils import create_undistortion_maps
 
 
@@ -163,6 +163,8 @@ def main():
                             help='Maximum number of observations per track')
     recon_group.add_argument('--do_metric_depth', action='store_true', default=True, 
                             help='Use MoGe model to estimate metric depth')
+    recon_group.add_argument('--use_inverse_depth', action='store_true', default=False,
+                            help='Use inverse-depth parametrization in reconstruction (matches offline option)')
     
     # Visualization options
     viz_group = parser.add_argument_group('🎥 Visualization Options')
@@ -264,6 +266,7 @@ def main():
         do_metric_depth=args.do_metric_depth,
         save_debug_projections=args.save_debug_projections,
         model_path=args.model_path,
+        use_inverse_depth=args.use_inverse_depth,
     )
     
 
