@@ -22,16 +22,17 @@ from utils.chunk_reconstruction import ChunkPTRecon
 from utils.reconstruction_alignment import create_view_graph_matches, align_and_refine_reconstructions
 
 
-def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool]) -> Dict:
+def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, bool]) -> Dict:
     """Top-level worker to reconstruct a single chunk and persist to disk.
 
     Args:
-        args: Tuple of (chunk_index, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth)
+        args: Tuple of (chunk_index, chunk_path, recon_dir, max_obs_per_track,
+                        use_inverse_depth, write_ply_flag, use_lk_refinement, debug_lk_refinement)
 
     Returns:
         Dict with result metadata: {'idx', 'sfm_path', 'ply_path', 'num_frames', 'duration_s', 'fps', 'error'}
     """
-    idx, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth, write_ply_flag = args
+    idx, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth, write_ply_flag, use_lk_refinement, debug_lk_refinement = args
     t0 = time.time()
     sfm_path = os.path.join(recon_dir, f"chunk_{idx:06d}.sfm")
     ply_path = os.path.join(recon_dir, f"chunk_{idx:06d}.ply")
@@ -41,8 +42,8 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool]) -> Dict:
         data: Dict = torch.load(chunk_path, map_location='cpu')
 
         # Determine target size
-        H = int(data.get('original_height', 0) or (int(data['images'].shape[-2]) if 'images' in data and data['images'] is not None else 1080))
-        W = int(data.get('original_width', 0) or (int(data['images'].shape[-1]) if 'images' in data and data['images'] is not None else 1920))
+        H = int(data.get('original_height', 0) or (int(data['gray_images'].shape[-2]) if 'gray_images' in data and data['gray_images'] is not None else 1080))
+        W = int(data.get('original_width', 0) or (int(data['gray_images'].shape[-1]) if 'gray_images' in data and data['gray_images'] is not None else 1920))
 
         # Ensure intrinsics if camera_params present
         if 'camera_params' in data and data['camera_params'] is not None:
@@ -55,7 +56,23 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool]) -> Dict:
             data,
             max_observations_per_track=max_obs_per_track,
             use_inverse_depth=use_inverse_depth,
+            use_lk_refinement=use_lk_refinement,
+            collect_debug=debug_lk_refinement,
         )
+
+        # Optional: save a debug visualization comparing projected vs final LK points
+        if debug_lk_refinement:
+            try:
+                # Pick the first available source frame from collected pairs
+                pairs_keys = list(reconstructor._debug_pairs.keys())
+                if pairs_keys:
+                    src = pairs_keys[0][0]
+                    tgts = [t for (s, t) in pairs_keys if s == src]
+                    if tgts:
+                        dbg_path = os.path.join(recon_dir, f"debug_chunk_{idx:06d}_src_{src}.png")
+                        reconstructor.debug_projections(data, src, tgts, save_path=dbg_path)
+            except Exception as _:
+                pass
 
         # Save SFM
         pt.io.WriteReconstruction(recon, sfm_path)
@@ -98,16 +115,27 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool]) -> Dict:
 
 
 class OfflineReconstructor:
-    def __init__(self, chunk_dir: str, output_dir: str, chunk_length: Optional[int] = None, 
-                 overlap: Optional[int] = None, max_observations_per_track: int = 5, save_per_chunk: bool = False,
-                 use_inverse_depth: bool = False, num_workers: Optional[int] = None):
+    def __init__(self, 
+                chunk_dir: str, 
+                output_dir: str, 
+                chunk_length: Optional[int] = None, 
+                 overlap: Optional[int] = None, 
+                 max_observations_per_track: int = 5, 
+                 save_per_chunk: bool = False,
+                 use_inverse_depth: bool = False, 
+                 num_workers: Optional[int] = None, 
+                 use_lk_refinement: bool = False, 
+                 debug_lk_refinement: bool = False):
         self.chunk_dir = chunk_dir
         self.output_dir = output_dir
+        self.use_lk_refinement = use_lk_refinement
+        self.debug_lk_refinement = debug_lk_refinement
 
         # Auto-load metadata if not provided
         meta_path = os.path.join(self.chunk_dir, 'chunk_metadata.json')
         loaded_chunk_length = None
         loaded_overlap = None
+
         try:
             import json
             if os.path.exists(meta_path):
@@ -151,7 +179,11 @@ class OfflineReconstructor:
         # Build reconstruction
         recon = self.reconstructor.create_recon_from_chunk(chunk, 
             max_observations_per_track=self.max_observations_per_track,
-            use_inverse_depth=self.use_inverse_depth)
+            use_inverse_depth=self.use_inverse_depth,
+            use_lk_refinement=self.use_lk_refinement,
+            collect_debug=self.debug_lk_refinement)
+        
+        
         return recon
 
     def _save_chunk_reconstruction(self, recon: pt.sfm.Reconstruction, idx: int) -> None:
@@ -187,7 +219,9 @@ class OfflineReconstructor:
         # Stage 1: parallel per-chunk reconstruction -> write SFM (and optional PLY) to disk
         print(f"🚀 Launching {self.num_workers} workers for per-chunk reconstruction...")
         tasks = [
-            (idx, path, self.recon_dir, self.max_observations_per_track, self.use_inverse_depth, self.save_per_chunk)
+            (idx, path, self.recon_dir, self.max_observations_per_track, 
+              self.use_inverse_depth, self.save_per_chunk, 
+              self.use_lk_refinement, self.debug_lk_refinement)
             for idx, path in enumerate(chunk_files)
         ]
         results_by_idx: Dict[int, Dict] = {}

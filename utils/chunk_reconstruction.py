@@ -9,6 +9,8 @@ import pytheia as pt
 from pi3.utils.camera import Camera
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import cv2
+import os
 
 class ChunkPTRecon:
     """
@@ -25,6 +27,12 @@ class ChunkPTRecon:
         self.view_ids = []
         self.track_ids = []
         self.use_inverse_depth = False
+        # cache for uint8 grayscale images used by LK
+        self._gray_image_cache = {}
+        self._gray_cache_dir = os.path.join("logs", "gray_cache")
+        # store projected vs final (LK-refined) points for debugging visualization
+        self._debug_pairs = {}
+        self._collect_debug = False
 
     def set_target_size(self, original_width: int, original_height: int):
         """
@@ -33,7 +41,12 @@ class ChunkPTRecon:
         self.original_width = original_width
         self.original_height = original_height
 
-    def create_recon_from_chunk(self, chunk_data: Dict, max_observations_per_track: int = 5, use_inverse_depth: bool = False) -> pt.sfm.Reconstruction:
+    def create_recon_from_chunk(self, chunk_data: Dict, 
+        max_observations_per_track: int = 5, 
+        use_inverse_depth: bool = False, 
+        use_lk_refinement: bool = False, 
+        lk_params: Optional[Dict] = None, 
+        collect_debug: bool = False) -> pt.sfm.Reconstruction:
         """
         Create PyTheia reconstruction from chunk data.
         
@@ -47,6 +60,12 @@ class ChunkPTRecon:
                 - 'conf_kp': Keypoint confidences (N, num_keypoints) - optional
                 - 'masks_kp': Keypoint masks (N, num_keypoints) - optional
             max_observations_per_track: Maximum number of observations to create per track (default: 5)
+            use_inverse_depth: Toggle inverse-depth parametrization during BA
+            use_lk_refinement: If True, refine projected 2D points using Lucas–Kanade optical flow
+            lk_params: Optional dict overriding LK params: {
+                'win': (w, h), 'levels': int, 'criteria': (type, count, eps), 'max_deviation_px': float
+            }
+            collect_debug: If True, record projected vs final 2D points for debugging plots
         
         Returns:
             PyTheia reconstruction object
@@ -56,6 +75,8 @@ class ChunkPTRecon:
         self.view_ids = []
         self.track_ids = []
         self.use_inverse_depth = use_inverse_depth
+        self._collect_debug = bool(collect_debug)
+        self._debug_pairs = {} if self._collect_debug else {}
         
         # Check if keypoints are available
         has_keypoints = ('keypoints' in chunk_data and 
@@ -131,7 +152,7 @@ class ChunkPTRecon:
                 colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
                 # masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
-                #descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
+                # descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
 
                 # Create tracks for this frame
                 frame_track_ids = []
@@ -170,19 +191,85 @@ class ChunkPTRecon:
                 projected_points = self._project_points_to_other_cams(
                     chunk_data, frame_idx, all_frames
                 )
-                
-                # Add observations for projected points (with limit per track)
-                for other_frame_idx, projected_kps in zip(all_frames, projected_points):
-                    for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
-                        # Check if projected point is within image bounds
-                        if (0 <= projected_pt[0] < self.original_width and 
-                            0 <= projected_pt[1] < self.original_height):
-                            # Only add observation if we haven't reached the limit
-                            self.reconstruction.AddObservation(
-                                self.view_ids[other_frame_idx],
-                                track_id,
-                                pt.sfm.Feature(projected_pt)
+
+                if use_lk_refinement:
+                    # Prepare Lucas–Kanade refinement inputs (grayscale uint8 images)
+                    try:
+                        source_gray = self._get_gray_image(chunk_data, frame_idx)
+                        target_grays = {t_idx: self._get_gray_image(chunk_data, t_idx) for t_idx in all_frames}
+                    except Exception as _:
+                        source_gray = None
+                        target_grays = {}
+                    
+                    # Add observations for projected points (with LK refinement and bounds check)
+                    _lk = lk_params or {}
+                    lk_win = tuple(_lk.get('win', (9, 9)))
+                    lk_levels = int(_lk.get('levels', 2))
+                    lk_criteria = _lk.get('criteria', (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.01))
+                    deviation_thresh_px = float(_lk.get('max_deviation_px', 3.0))
+
+                    for other_frame_idx, projected_kps in zip(all_frames, projected_points):
+                        # default: use projections; optionally refine with LK if images available
+                        final_points = projected_kps.copy()
+
+                        if source_gray is not None and other_frame_idx in target_grays and target_grays[other_frame_idx] is not None:
+                            prev_pts = chunk_data['keypoints'][frame_idx].cpu().numpy().astype(np.float32).reshape(-1, 1, 2)
+                            next_pts, status, _err = cv2.calcOpticalFlowPyrLK(
+                                source_gray, target_grays[other_frame_idx], prev_pts, None,
+                                winSize=lk_win, maxLevel=lk_levels, criteria=lk_criteria
                             )
+                            if next_pts is not None and status is not None:
+                                next_pts = next_pts.reshape(-1, 2)
+                                status = status.reshape(-1)
+                                # decide per point whether to accept LK or keep projection
+                                for kp_idx in range(final_points.shape[0]):
+                                    if status[kp_idx] == 1:
+                                        lk_pt = next_pts[kp_idx]
+                                        proj_pt = projected_kps[kp_idx]
+                                        
+                                        # accept LK if close to projection; otherwise keep projection
+                                        if np.linalg.norm(lk_pt - proj_pt) <= deviation_thresh_px:
+                                            final_points[kp_idx] = lk_pt
+                            
+                        # Store for debug: projections vs final
+                        if self._collect_debug:
+                            try:
+                                self._debug_pairs[(frame_idx, other_frame_idx)] = {
+                                    'projected': projected_kps.copy(),
+                                    'final': final_points.copy(),
+                                }
+                            except Exception:
+                                pass
+
+                        # Add observations for final points
+                        for kp_idx, (track_id, final_pt) in enumerate(zip(frame_track_ids, final_points)):
+                            if (0 <= final_pt[0] < self.original_width and 
+                                0 <= final_pt[1] < self.original_height):
+                                self.reconstruction.AddObservation(
+                                    self.view_ids[other_frame_idx],
+                                    track_id,
+                                    pt.sfm.Feature(final_pt)
+                                )
+                else:
+                    # LK disabled: add observations from projected points only
+                    for other_frame_idx, projected_kps in zip(all_frames, projected_points):
+                        # Store for debug: projections only
+                        if self._collect_debug:
+                            try:
+                                self._debug_pairs[(frame_idx, other_frame_idx)] = {
+                                    'projected': projected_kps.copy(),
+                                    'final': projected_kps.copy(),
+                                }
+                            except Exception:
+                                pass
+                        for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
+                            if (0 <= projected_pt[0] < self.original_width and 
+                                0 <= projected_pt[1] < self.original_height):
+                                self.reconstruction.AddObservation(
+                                    self.view_ids[other_frame_idx],
+                                    track_id,
+                                    pt.sfm.Feature(projected_pt)
+                                )
 
         if self.use_inverse_depth:
             self.reconstruction.InitializeInverseDepth()
@@ -194,253 +281,168 @@ class ChunkPTRecon:
         ba_options.use_inner_iterations = False
         ba_options.use_mixed_precision_solves = True
         ba_options.max_num_refinement_iterations = 1
+        ba_options.verbose = True
         ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
-        ba_options.preconditioner_type = pt.sfm.PreconditionerType.IDENTITY
+        ba_options.preconditioner_type = pt.sfm.PreconditionerType.JACOBI
         ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
+        ba_options.dense_linear_algebra_library_type =  pt.sfm.DenseLinearAlgebraLibraryType.CUDA #pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        # ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE 
+
         if self.use_inverse_depth:
             ba_options.use_homogeneous_point_parametrization = False
-            ba_options.use_inverse_depth_parametrization = True
-        else:
-            ba_options.use_homogeneous_point_parametrization = True
             ba_options.use_inverse_depth_parametrization = False
-        ba_options.verbose = False
+        else:
+            ba_options.use_homogeneous_point_parametrization = False
+            ba_options.use_inverse_depth_parametrization = False
+
         ba_options.robust_loss_width = 2.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
         ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
-
-        # # Perform a second BA to refine the inverse depth
-        # if self.use_inverse_depth:
-        #     ba_options.use_homogeneous_point_parametrization = True
-        #     ba_options.use_inverse_depth_parametrization = False
-        #     ba_options.max_num_iterations = 2
-        #     ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
 
         removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(
             set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)
         print(f"   Removed {removed_tracks} tracks after initial bundle adjustment")
 
         return self.reconstruction
-    
+
+    def _get_gray_image(self, chunk_data: Dict, frame_idx: int) -> np.ndarray:
+        """
+        Return uint8 grayscale image (H, W) for the given frame index, caching and saving to disk.
+        Images are resized to (original_height, original_width).
+        """
+        if frame_idx in self._gray_image_cache:
+            return self._gray_image_cache[frame_idx]
+
+        # Do not write images to disk here; only use in-memory cache or precomputed gray_images
+
+        # Prefer precomputed gray_images in chunk_data to avoid recomputation
+        try:
+            if 'gray_images' in chunk_data and frame_idx < len(chunk_data['gray_images']):
+                g = chunk_data['gray_images'][frame_idx]
+                if isinstance(g, torch.Tensor):
+                    gray_u8 = g.detach().cpu().numpy()
+                else:
+                    gray_u8 = np.array(g)
+                if gray_u8.dtype != np.uint8:
+                    gray_u8 = gray_u8.astype(np.uint8)
+                # Ensure HxW
+                if gray_u8.ndim == 3:
+                    gray_u8 = gray_u8.squeeze()
+                # Ensure size
+                if gray_u8.shape[0] != self.original_height or gray_u8.shape[1] != self.original_width:
+                    gray_u8 = cv2.resize(gray_u8, (self.original_width, self.original_height), interpolation=cv2.INTER_AREA)
+                self._gray_image_cache[frame_idx] = gray_u8
+                return gray_u8
+        except Exception:
+            pass
+        # If not available, return None (caller can handle fallback behavior)
+        return None
+
     def debug_projections(self, chunk_data: Dict, source_frame: int, target_frames: List[int], 
-                         save_path: Optional[str] = None, fps: int = 1) -> None:
+                         save_path: Optional[str] = None) -> None:
         """
-        Debug keypoint projections from source frame to target frames.
+        Visualize projections vs. final observations used during reconstruction, to validate LK refinement.
         
-        This method visualizes how keypoints from a source frame are projected onto target frames,
-        which is useful for debugging the reconstruction process.
-        
-        Args:
-            chunk_data: Dictionary containing chunk data with keypoints, camera poses, and intrinsics
-            source_frame: Index of the source frame
-            target_frames: List of target frame indices to project to
-            save_path: Optional path to save the visualization as GIF (e.g., "debug_projection.gif")
-            fps: Frames per second for the GIF animation
+        This plots, for each target frame, the projected points (green) and the actually used points
+        (magenta) as stored in `self._debug_pairs[(source_frame, target_frame)]`.
         """
-        print(f"🔍 Debugging keypoint projections from frame {source_frame} to frames {target_frames}")
         import time
         _t0 = time.time()
-        
-        # Check if keypoints are available
-        if not all(key in chunk_data for key in ['keypoints', 'points', 'camera_poses']):
-            print("❌ Missing required data for debug_projections")
-            return
-        
-        # Determine number of frames available
-        def _num_frames(x):
-            try:
-                import torch
-                if isinstance(x, torch.Tensor):
-                    return int(x.shape[0])
-            except Exception:
-                pass
-            try:
-                return len(x)
-            except Exception:
-                return 0
 
-        num_frames = _num_frames(chunk_data.get('camera_poses', []))
-
-        # Validate source and target frames against available frames
-        if not (0 <= source_frame < num_frames):
-            print(f"❌ debug_projections: source_frame {source_frame} out of range [0, {num_frames-1}] — skipping")
+        if not target_frames:
+            print("⚠️  debug_projections: no target_frames provided")
             return
 
-        # Filter target_frames to valid range and exclude source_frame
-        filtered_targets = [f for f in target_frames if 0 <= f < num_frames and f != source_frame]
-        dropped = [f for f in target_frames if f not in filtered_targets]
-        if dropped:
-            print(f"⚠️  debug_projections: dropped out-of-range targets {dropped}; valid range is [0, {num_frames-1}]")
-        target_frames = filtered_targets
-        if len(target_frames) == 0:
-            print("⚠️  debug_projections: no valid target frames after filtering — skipping")
-            return
-
-        # Get source frame data
-        source_keypoints = chunk_data['keypoints'][source_frame].cpu().numpy()  # (num_keypoints, 2)
-        source_points_3d = chunk_data['points'][source_frame].cpu().numpy()  # (num_keypoints, 3)
-        
-        print(f"   Source frame {source_frame}: {len(source_keypoints)} keypoints")
-        
-        # Project points to target frames
-        _t0_proj = time.time()
-        projected_points_list = self._project_points_to_other_cams(chunk_data, source_frame, target_frames)
-        print(f"   ⏱️ projection time: {(time.time()-_t0_proj)*1000:.1f}ms for {len(target_frames)} targets")
-        
-        # Load images if available
+        # Build image list (prefer stored grayscale to avoid disk I/O)
         images = []
-        if 'images' in chunk_data:
-            for frame_idx in [source_frame] + target_frames:
+        frames_to_fetch = [source_frame] + target_frames
+        if 'gray_images' in chunk_data and chunk_data['gray_images'] is not None:
+            for frame_idx in frames_to_fetch:
+                if frame_idx < len(chunk_data['gray_images']):
+                    g = chunk_data['gray_images'][frame_idx]
+                    if isinstance(g, torch.Tensor):
+                        g = g.cpu().numpy()
+                    if g.ndim == 3:
+                        g = np.squeeze(g)
+                    if g.dtype != np.uint8:
+                        g = g.astype(np.uint8)
+                    images.append(g)
+                else:
+                    images.append(np.zeros((self.original_height, self.original_width), dtype=np.uint8))
+        elif 'images' in chunk_data and chunk_data['images'] is not None:
+            for frame_idx in frames_to_fetch:
                 if frame_idx < len(chunk_data['images']):
                     img = chunk_data['images'][frame_idx]
                     if isinstance(img, torch.Tensor):
                         img = img.cpu().numpy()
-                    
-                    # Convert from CHW to HWC if needed
-                    if len(img.shape) == 3 and img.shape[0] == 3:
+                    if img.ndim == 3 and img.shape[0] == 3:
                         img = np.transpose(img, (1, 2, 0))
-                    
-                    # Normalize to 0-255 range if needed
                     if img.max() <= 1.0:
                         img = (img * 255).astype(np.uint8)
-                    
                     images.append(img)
                 else:
-                    images.append(None)
+                    images.append(np.zeros((self.original_height, self.original_width, 3), dtype=np.uint8))
         else:
-            # Create blank images if no images available
             for _ in range(len(target_frames) + 1):
-                blank_img = np.zeros((self.original_height, self.original_width, 3), dtype=np.uint8)
-                images.append(blank_img)
-        
-        # Create single plot for video-style GIF
-        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-        
-        # For static visualization, show side-by-side comparison
-        if not save_path or not save_path.lower().endswith('.gif'):
-            # Create side-by-side visualization for static images
-            fig, axes = plt.subplots(1, len(target_frames) + 1, figsize=(2.5 * (len(target_frames) + 1), 2.5))
-            if len(target_frames) == 0:
-                axes = [axes]
-            
-            # Plot source frame
-            ax = axes[0]
-            if images[0] is not None:
-                ax.imshow(images[0])
-            ax.scatter(source_keypoints[:, 0], source_keypoints[:, 1], c='red', s=8, alpha=0.7)
-            ax.set_title(f'Source Frame {source_frame}\n{len(source_keypoints)} keypoints', fontsize=10)
-            ax.axis('off')
-            
-            # Plot target frames with projected keypoints
-            for i, (target_frame, projected_points) in enumerate(zip(target_frames, projected_points_list)):
-                ax = axes[i + 1]
-                if images[i + 1] is not None:
-                    ax.imshow(images[i + 1])
-                
-                # Filter projected points that are within image bounds
-                valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
-                             (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
-                
-                valid_projected = projected_points[valid_mask]
-                invalid_projected = projected_points[~valid_mask]
-                
-                # Plot valid projected keypoints in green (smaller size)
-                if len(valid_projected) > 0:
-                    ax.scatter(valid_projected[:, 0], valid_projected[:, 1], c='green', s=8, alpha=0.7, label='Valid')
-                
-                # Plot invalid projected keypoints in red (outside bounds, smaller size)
-                if len(invalid_projected) > 0:
-                    ax.scatter(invalid_projected[:, 0], invalid_projected[:, 1], c='red', s=8, alpha=0.7, label='Invalid')
-                
-                ax.set_title(f'Target Frame {target_frame}\n{len(valid_projected)}/{len(projected_points)} valid', fontsize=10)
-                ax.axis('off')
-                
-                if len(valid_projected) > 0 or len(invalid_projected) > 0:
-                    ax.legend(fontsize=8)
-            
-            plt.tight_layout()
-        
-        # Save visualization if path provided
-        if save_path:
-            if save_path.lower().endswith('.gif'):
-                # Create video-style animated GIF that shows sequential frames with keypoints
-                def animate(frame_idx):
-                    ax.clear()
-                    ax.axis('off')
-                    
-                    if frame_idx == 0:
-                        # Show source frame with source keypoints
-                        if images[0] is not None:
-                            ax.imshow(images[0])
-                        ax.scatter(source_keypoints[:, 0], source_keypoints[:, 1], c='red', s=12, alpha=0.8)
-                        ax.set_title(f'Source Frame {source_frame} - Original Keypoints\n{len(source_keypoints)} keypoints', fontsize=12, pad=10)
-                    
-                    elif frame_idx <= len(target_frames):
-                        # Show target frames with projected keypoints
-                        target_idx = frame_idx - 1
-                        target_frame = target_frames[target_idx]
-                        projected_points = projected_points_list[target_idx]
-                        
-                        if images[target_idx + 1] is not None:
-                            ax.imshow(images[target_idx + 1])
-                        
-                        # Filter projected points that are within image bounds
-                        valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
-                                     (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
-                        
-                        valid_projected = projected_points[valid_mask]
-                        invalid_projected = projected_points[~valid_mask]
-                        
-                        # Plot valid projected keypoints in bright green
-                        if len(valid_projected) > 0:
-                            ax.scatter(valid_projected[:, 0], valid_projected[:, 1], c='lime', s=12, alpha=0.8, 
-                                     edgecolors='darkgreen', linewidths=0.5)
-                        
-                        # Plot invalid projected keypoints in red (outside bounds)
-                        if len(invalid_projected) > 0:
-                            ax.scatter(invalid_projected[:, 0], invalid_projected[:, 1], c='red', s=12, alpha=0.8,
-                                     edgecolors='darkred', linewidths=0.5)
-                        
-                        ax.set_title(f'Frame {target_frame} - Projected Keypoints\n{len(valid_projected)} valid, {len(invalid_projected)} invalid', 
-                                   fontsize=12, pad=10)
-                    
-                    # Set consistent axis limits
-                    ax.set_xlim(0, self.original_width)
-                    ax.set_ylim(self.original_height, 0)  # Invert y-axis for image coordinates
-                    
-                    return [ax]
-                
-                # Create animation that shows source frame + all target frames
-                total_frames = 1 + len(target_frames)  # Source frame + target frames
-                anim = animation.FuncAnimation(fig, animate, frames=total_frames, 
-                                             interval=max(500, 1000//fps), repeat=True)
-                
-                # Ensure directory exists
-                import os
-                save_dir = os.path.dirname(save_path)
-                if save_dir:  # Only create directory if path contains one
-                    os.makedirs(save_dir, exist_ok=True)
-                
-                anim.save(save_path, writer='pillow', fps=fps)
-                print(f"💾 Saved video-style projection GIF to: {save_path}")
-                plt.close(fig)  # Close figure to save memory
+                images.append(np.zeros((self.original_height, self.original_width), dtype=np.uint8))
+
+        # Create side-by-side plot: source + per-target overlay of projected vs final
+        fig, axes = plt.subplots(1, len(target_frames) + 1, figsize=(3.2 * (len(target_frames) + 1), 3.0))
+        if len(target_frames) == 0:
+            axes = [axes]
+
+        # Plot source frame with original keypoints (red)
+        ax = axes[0]
+        if images[0] is not None:
+            if images[0].ndim == 2:
+                ax.imshow(images[0], cmap='gray', vmin=0, vmax=255)
             else:
-                # Save as static image
-                plt.savefig(save_path, dpi=100, bbox_inches='tight')
-                print(f"💾 Saved debug projection image to: {save_path}")
-                plt.close(fig)  # Close figure to save memory
+                ax.imshow(images[0])
+        src_kp = chunk_data['keypoints'][source_frame].cpu().numpy()
+        ax.scatter(src_kp[:, 0], src_kp[:, 1], c='red', s=8, alpha=0.7)
+        ax.set_title(f'Source {source_frame}\nK={len(src_kp)}', fontsize=10)
+        ax.axis('off')
+
+        # Plot per target: projected (green) vs final (magenta)
+        for i, target_frame in enumerate(target_frames):
+            ax = axes[i + 1]
+            if images[i + 1] is not None:
+                if images[i + 1].ndim == 2:
+                    ax.imshow(images[i + 1], cmap='gray', vmin=0, vmax=255)
+                else:
+                    ax.imshow(images[i + 1])
+
+            pair = self._debug_pairs.get((source_frame, target_frame), None)
+            if pair is not None:
+                projected = pair['projected']
+                final = pair['final']
+                # Bounds mask for clarity
+                valid_mask = ((0 <= projected[:, 0]) & (projected[:, 0] < self.original_width) &
+                              (0 <= projected[:, 1]) & (projected[:, 1] < self.original_height))
+                proj_valid = projected[valid_mask]
+                fin_valid = final[valid_mask]
+                if len(proj_valid) > 0:
+                    ax.scatter(proj_valid[:, 0], proj_valid[:, 1], c='lime', s=10, alpha=0.8, label='Projected')
+                if len(fin_valid) > 0:
+                    ax.scatter(fin_valid[:, 0], fin_valid[:, 1], c='magenta', s=10, alpha=0.8, label='Final')
+                if len(proj_valid) > 0 or len(fin_valid) > 0:
+                    ax.legend(fontsize=8)
+            else:
+                ax.text(0.5, 0.5, 'no data', transform=ax.transAxes, ha='center', va='center')
+
+            ax.set_title(f'Target {target_frame}', fontsize=10)
+            ax.axis('off')
+
+        plt.tight_layout()
+
+        # Save or show
+        if save_path:
+            plt.savefig(save_path, dpi=110, bbox_inches='tight')
+            print(f"💾 Saved debug overlay to: {save_path}")
+            plt.close(fig)
         else:
-            print(f"   ⏱️ total debug projection time: {(time.time()-_t0)*1000:.1f}ms")
+            print(f"   ⏱️ debug overlay time: {(time.time()-_t0)*1000:.1f}ms")
             plt.show()
-        
-        # Print statistics
-        print(f"\n📊 Projection Statistics:")
-        print(f"   Source frame {source_frame}: {len(source_keypoints)} keypoints")
-        for target_frame, projected_points in zip(target_frames, projected_points_list):
-            valid_mask = ((0 <= projected_points[:, 0]) & (projected_points[:, 0] < self.original_width) &
-                         (0 <= projected_points[:, 1]) & (projected_points[:, 1] < self.original_height))
-            valid_count = np.sum(valid_mask)
-            total_count = len(projected_points)
-            print(f"   Target frame {target_frame}: {valid_count}/{total_count} valid projections ({100*valid_count/total_count:.1f}%)")
     
     def _project_points_to_other_cams(self, chunk_data: Dict, source_frame: int, target_frames: List[int]) -> List[np.ndarray]:
         """

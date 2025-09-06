@@ -250,7 +250,26 @@ class OfflineChunkCreator:
         if 'camera_params' in cpu_result and cpu_result['camera_params'] is not None:
             cpu_result['intrinsics'] = cpu_result['camera_params'].get('intrinsics', None)
 
-        # Drop raw images before saving to reduce size (not needed for reconstruction)
+        # Create and store uint8 grayscale images for LK refinement
+        try:
+            imgs = cpu_result.get('images', None)
+            if imgs is not None:
+                # imgs: (N, C, H, W) in [0,1] float
+                import numpy as _np
+                import cv2 as _cv2
+                imgs_np = imgs.numpy()
+                if imgs_np.ndim == 4 and imgs_np.shape[1] == 3:
+                    imgs_np = (imgs_np * 255.0).clip(0, 255).astype(_np.uint8)
+                    imgs_np = _np.transpose(imgs_np, (0, 2, 3, 1))  # NCHW -> NHWC
+                    gray_list = []
+                    for i in range(imgs_np.shape[0]):
+                        gray = _cv2.cvtColor(imgs_np[i], _cv2.COLOR_RGB2GRAY)
+                        gray_list.append(gray)
+                    cpu_result['gray_images'] = torch.from_numpy(_np.stack(gray_list, axis=0))  # (N, H, W), uint8
+        except Exception as _e:
+            print(f"⚠️  Failed to create gray_images: {_e}")
+
+        # Drop raw color images to reduce size
         try:
             if 'images' in cpu_result:
                 del cpu_result['images']
