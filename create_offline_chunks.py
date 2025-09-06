@@ -42,19 +42,22 @@ def list_images(root: str) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Create offline PI3 chunks and save to disk")
-    parser.add_argument("--images", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/", help="Folder with images, a glob pattern, or a text file listing image paths")
-    parser.add_argument("--model-path", default="yyfz233/Pi3", help="Pi3 model identifier or local path for Pi3.from_pretrained")
-    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/chunks", help="Output directory")
-    parser.add_argument("--chunk-length", type=int, default=50)
+    parser.add_argument("--images", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/", help="Folder with images, a glob pattern, or a text file listing image paths")
+    parser.add_argument("--model-path", default="/home/steffen/ModelWeights/pi3/model.safetensors", help="Pi3 model identifier or local path for Pi3.from_pretrained")
+    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/chunks", help="Output directory")
+    parser.add_argument("--chunk-length", type=int, default=560)
     parser.add_argument("--overlap", type=int, default=5)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--cam-dist-path", type=str, default=None, help="Path to camera calibration file for undistortion")
     parser.add_argument("--metric-depth", action="store_true", help="Enable MoGe metric scaling")
     parser.add_argument("--keypoints", default="grid", choices=["aliked", "grid", "none"])
-    parser.add_argument("--max-kp", type=int, default=200)
+    parser.add_argument("--max-kp", type=int, default=100)
     parser.add_argument("--kp-threshold", type=float, default=0.005)
-    parser.add_argument("--estimate-intrinsics", action="store_true", default=True)
+    parser.add_argument("--estimate-intrinsics", default=True)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--fp8", default=True)
+    parser.add_argument("--attention-merge", default=True)
+    parser.add_argument("--merging-ratio", type=float, default=0.9)
     # Optional frame range controls (consistent with online CLI)
     parser.add_argument("--skip-start", type=int, default=0, help="Number of frames to skip from the beginning")
     parser.add_argument("--skip-end", type=int, default=0, help="Number of frames to skip from the end")
@@ -74,6 +77,11 @@ def main():
         raise SystemExit(f"Invalid frame range after skipping: start {effective_start}, end {effective_end}")
     image_paths = image_paths[effective_start:effective_end]
 
+    # if chunk length not divisible by 8 fp 8 does not work
+    if args.chunk_length % 8 != 0:
+        args.fp8 = False
+        print(f"Chunk length {args.chunk_length} is not divisible by 8. FP8 does not work. Falling back to float16.")
+
     cfg = OfflineCreatorConfig(
         model_path=args.model_path,
         output_dir=args.output,
@@ -87,6 +95,9 @@ def main():
         estimate_camera_params=args.estimate_intrinsics,
         num_loader_workers=args.num_workers,
         cam_dist_path=args.cam_dist_path,
+        do_fp8=args.fp8,
+        do_attention_merge=args.attention_merge,
+        merging_ratio=args.merging_ratio,
     )
 
     creator = OfflineChunkCreator(cfg)

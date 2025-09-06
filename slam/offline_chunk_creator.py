@@ -48,6 +48,9 @@ class OfflineCreatorConfig:
     num_loader_workers: int = 2
     pin_memory: bool = True
     cam_dist_path: Optional[str] = None
+    do_fp8: bool = False
+    do_attention_merge: bool = False
+    merging_ratio: float = 0.8
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -62,12 +65,22 @@ class OfflineChunkCreator:
         os.makedirs(self.chunks_dir, exist_ok=True)
 
         # Load Pi3
-        self.model: Pi3 = Pi3.from_pretrained(self.config.model_path).to(self.config.device).eval()
-
-        self.model.do_global_merging = True
-        self.model.merging = 0
-        self.model.merge_ratio = 0.9
-
+        if self.config.model_path.endswith('.safetensors'):
+            self.model: Pi3 = Pi3(use_fp8_attention=self.config.do_fp8,
+                                    global_merging=self.config.do_attention_merge,
+                                    merge_ratio=self.config.merging_ratio,
+                                    ).to(self.config.device).eval()
+            # load state dict
+            if self.config.model_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                weight = load_file(self.config.model_path)
+            else:
+                weight = torch.load(self.config.model_path, map_location=self.config.device, weights_only=False)
+                
+            # Allow additional keys introduced by FP8 TE layers (e.g., _extra_state)
+            self.model.load_state_dict(weight, strict=False)
+        else:
+            self.model = Pi3.from_pretrained("yyfz233/Pi3").to(self.config.device).eval()
         # self.model = torch.compile(self.model)
 
         # Load MoGe if requested

@@ -18,15 +18,15 @@ from slam.offline_reconstructor import OfflineReconstructor
 
 def main():
     parser = argparse.ArgumentParser(description="Reconstruct from saved PI3 chunks")
-    parser.add_argument("--chunks", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/chunks", help="Directory containing chunk_*.pt files")
-    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/reconstruction", help="Directory to write reconstructions (sfm/ply)")
+    parser.add_argument("--chunks", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/chunks", help="Directory containing chunk_*.pt files")
+    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/reconstruction", help="Directory to write reconstructions (sfm/ply)")
     parser.add_argument("--chunk-length", type=int, default=None)
     parser.add_argument("--overlap", type=int, default=None)
     parser.add_argument("--max-observations-per-track", type=int, default=5)
-    parser.add_argument("--save-per-chunk", action="store_true", help="Save per-chunk .sfm/.ply files as well")
-    parser.add_argument("--use-inverse-depth", action="store_true", help="Use inverse depth parametrization")
-    parser.add_argument("--num-workers", type=int, default=10)
-    parser.add_argument("--use-lk-refinement", action="store_true", help="Use Lucas-Kanade refinement")
+    parser.add_argument("--save-per-chunk", default=True, help="Save per-chunk .sfm/.ply files as well")
+    parser.add_argument("--use-inverse-depth", default=True, help="Use inverse depth parametrization")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of worker processes. Set to 0 to run sequentially.")
+    parser.add_argument("--use-lk-refinement", default=True, help="Use Lucas-Kanade refinement")
     parser.add_argument("--debug-lk-refinement", action="store_true", help="Debug Lucas-Kanade refinement")
     args = parser.parse_args()
 

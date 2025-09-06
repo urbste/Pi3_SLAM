@@ -16,13 +16,14 @@ import numpy as np
 import pytheia as pt
 import time
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pi3.utils.basic import write_ply
 
 from utils.chunk_reconstruction import ChunkPTRecon
 from utils.reconstruction_alignment import create_view_graph_matches, align_and_refine_reconstructions
 
 
-def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, bool]) -> Dict:
+def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, bool, bool]) -> Dict:
     """Top-level worker to reconstruct a single chunk and persist to disk.
 
     Args:
@@ -32,7 +33,7 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, 
     Returns:
         Dict with result metadata: {'idx', 'sfm_path', 'ply_path', 'num_frames', 'duration_s', 'fps', 'error'}
     """
-    idx, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth, write_ply_flag, use_lk_refinement, debug_lk_refinement = args
+    idx, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth, write_ply_flag, use_lk_refinement, debug_lk_refinement, run_bundle_adjustment = args
     t0 = time.time()
     sfm_path = os.path.join(recon_dir, f"chunk_{idx:06d}.sfm")
     ply_path = os.path.join(recon_dir, f"chunk_{idx:06d}.ply")
@@ -58,6 +59,7 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, 
             use_inverse_depth=use_inverse_depth,
             use_lk_refinement=use_lk_refinement,
             collect_debug=debug_lk_refinement,
+            run_bundle_adjustment=run_bundle_adjustment,
         )
 
         # Optional: save a debug visualization comparing projected vs final LK points
@@ -216,17 +218,31 @@ class OfflineReconstructor:
         num_chunks = len(chunk_files)
         print(f"🔄 Reconstructing {num_chunks} chunks from {self.chunk_dir}")
 
-        # Stage 1: parallel per-chunk reconstruction -> write SFM (and optional PLY) to disk
-        print(f"🚀 Launching {self.num_workers} workers for per-chunk reconstruction...")
+        # Stage 1: parallel per-chunk reconstruction (without BA) -> write SFM (and optional PLY) to disk
+        print(f"🚀 Launching {self.num_workers} threads for per-chunk reconstruction (no BA in parallel)...")
         tasks = [
             (idx, path, self.recon_dir, self.max_observations_per_track, 
               self.use_inverse_depth, self.save_per_chunk, 
-              self.use_lk_refinement, self.debug_lk_refinement)
+              self.use_lk_refinement, self.debug_lk_refinement, False)  # run_bundle_adjustment=False
             for idx, path in enumerate(chunk_files)
         ]
         results_by_idx: Dict[int, Dict] = {}
-        with mp.Pool(processes=self.num_workers) as pool:
-            for res in pool.imap_unordered(_reconstruct_chunk_worker, tasks):
+
+        if self.num_workers and self.num_workers > 0:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                future_to_idx = {executor.submit(_reconstruct_chunk_worker, t): t[0] for t in tasks}
+                for future in as_completed(future_to_idx):
+                    res = future.result()
+                    idx = res['idx']
+                    results_by_idx[idx] = res
+                    if res['error'] is None:
+                        print(f"   ✅ Chunk {idx+1}/{num_chunks}: ⏱️ {res['duration_s']:.3f}s for {res['num_frames']} frames -> {res['fps']:.2f} FPS")
+                    else:
+                        print(f"   ❌ Chunk {idx+1}/{num_chunks} failed: {res['error']}")
+        else:
+            print("🧵 Running sequential per-chunk reconstruction (num_workers=0, no BA)...")
+            for task in tasks:
+                res = _reconstruct_chunk_worker(task)
                 idx = res['idx']
                 results_by_idx[idx] = res
                 if res['error'] is None:
@@ -234,7 +250,38 @@ class OfflineReconstructor:
                 else:
                     print(f"   ❌ Chunk {idx+1}/{num_chunks} failed: {res['error']}")
 
-        # Stage 2: sequential load + alignment
+        # Stage 2a: sequential bundle adjustment per chunk
+        print("\n🧮 Running bundle adjustment sequentially for each chunk...")
+        for idx in range(num_chunks):
+            res = results_by_idx.get(idx)
+            if res is None or res.get('sfm_path') is None:
+                print(f"   ⚠️ Skipping BA for chunk {idx}: no reconstruction available")
+                continue
+            try:
+                success, recon = pt.io.ReadReconstruction(res['sfm_path'])
+                if not success:
+                    print(f"   ❌ Failed to load reconstruction for BA (chunk {idx}): {recon}")
+                    continue
+            except Exception as e:
+                print(f"   ❌ Failed to load reconstruction for BA (chunk {idx}): {e}")
+                continue
+
+            # Run BA in-place using helper
+            try:
+                tmp = ChunkPTRecon()
+                tmp.reconstruction = recon
+                tmp.use_inverse_depth = self.use_inverse_depth
+                tmp.run_bundle_adjustment()
+                # Write back after BA
+                pt.io.WriteReconstruction(tmp.reconstruction, res['sfm_path'])
+                if self.save_per_chunk:
+                    ply_path = os.path.join(self.recon_dir, f"chunk_{idx:06d}.ply")
+                    color = [255, 255, 255]
+                    pt.io.WritePlyFile(ply_path, tmp.reconstruction, color, 1)
+            except Exception as e:
+                print(f"   ❌ BA failed for chunk {idx}: {e}")
+
+        # Stage 2b: sequential load + alignment
         print("\n🔗 Aligning reconstructions sequentially...")
         for idx in range(num_chunks):
             res = results_by_idx.get(idx)

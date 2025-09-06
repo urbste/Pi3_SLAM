@@ -2,6 +2,7 @@
 Chunk-based PyTheia reconstruction utilities for Pi3SLAM.
 """
 
+from sympy import true
 import torch
 import numpy as np
 from typing import Dict, List, Optional
@@ -46,7 +47,8 @@ class ChunkPTRecon:
         use_inverse_depth: bool = False, 
         use_lk_refinement: bool = False, 
         lk_params: Optional[Dict] = None, 
-        collect_debug: bool = False) -> pt.sfm.Reconstruction:
+        collect_debug: bool = False,
+        run_bundle_adjustment: bool = True) -> pt.sfm.Reconstruction:
         """
         Create PyTheia reconstruction from chunk data.
         
@@ -275,35 +277,44 @@ class ChunkPTRecon:
             self.reconstruction.InitializeInverseDepth()
 
         print(f"✅ Created reconstruction with {len(self.reconstruction.ViewIds())} views and {len(self.reconstruction.TrackIds())} tracks")
+        
+        if run_bundle_adjustment:
+            self.run_bundle_adjustment()
+        
+        return self.reconstruction
+
+    def run_bundle_adjustment(self) -> None:
+        """
+        Run bundle adjustment on the current reconstruction in-place.
+        """
         # Bundle adjust the reconstruction
         ba_options = pt.sfm.BundleAdjustmentOptions()
         ba_options.max_num_iterations = 10
         ba_options.use_inner_iterations = False
-        ba_options.use_mixed_precision_solves = True
+        ba_options.use_mixed_precision_solves = False
         ba_options.max_num_refinement_iterations = 1
         ba_options.verbose = True
+        ba_options.num_threads = 10
         ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
         ba_options.preconditioner_type = pt.sfm.PreconditionerType.JACOBI
         ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
-        ba_options.dense_linear_algebra_library_type =  pt.sfm.DenseLinearAlgebraLibraryType.CUDA #pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
-        # ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE 
+        ba_options.dense_linear_algebra_library_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE 
 
         if self.use_inverse_depth:
             ba_options.use_homogeneous_point_parametrization = False
-            ba_options.use_inverse_depth_parametrization = False
+            ba_options.use_inverse_depth_parametrization = True
         else:
-            ba_options.use_homogeneous_point_parametrization = False
+            ba_options.use_homogeneous_point_parametrization = True
             ba_options.use_inverse_depth_parametrization = False
 
         ba_options.robust_loss_width = 2.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
-        ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
+        pt.sfm.BundleAdjustReconstruction(ba_options, self.reconstruction)
 
         removed_tracks = pt.sfm.SetOutlierTracksToUnestimated(
             set(self.reconstruction.TrackIds()), 2, 0.25, self.reconstruction)
-        print(f"   Removed {removed_tracks} tracks after initial bundle adjustment")
-
-        return self.reconstruction
+        print(f"   Removed {removed_tracks} tracks after bundle adjustment")
 
     def _get_gray_image(self, chunk_data: Dict, frame_idx: int) -> np.ndarray:
         """

@@ -7,7 +7,7 @@ from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
-from .layers.attention import FlashAttentionRope
+from .layers.attention import FlashAttentionRope, AttentionRopeFP8
 from .layers.transformer_head import TransformerDecoder, LinearPts3d
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
@@ -18,9 +18,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             self,
             pos_type='rope100',
             decoder_size='large',
-            global_merging=True,
-            merging=0,
-            merge_ratio=0.9,
+            global_merging: bool = True,
+            merging: int = 0,
+            merge_ratio: float = 0.9,
+            use_fp8_attention: bool = True,
         ):
         super().__init__()
 
@@ -73,6 +74,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             dec_depth = 36
         else:
             raise NotImplementedError
+        attn_impl = AttentionRopeFP8 if use_fp8_attention else FlashAttentionRope
+        print(f"Using {attn_impl.__name__} for attention")
         self.decoder = nn.ModuleList([
             BlockRope(
                 dim=dec_embed_dim,
@@ -87,7 +90,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 ffn_layer=Mlp,
                 init_values=0.01,
                 qk_norm=True,
-                attn_class=FlashAttentionRope,
+                attn_class=attn_impl,
                 rope=self.rope
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
@@ -109,6 +112,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             dec_num_heads=16,
             out_dim=1024,
             rope=self.rope,
+            use_fp8_attention=use_fp8_attention,
         )
         self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
 
@@ -127,7 +131,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             dec_num_heads=16,                # 8
             out_dim=512,
             rope=self.rope,
-            use_checkpoint=False
+            use_checkpoint=False,
+            use_fp8_attention=use_fp8_attention,
         )
         self.camera_head = CameraHead(dim=512)
 

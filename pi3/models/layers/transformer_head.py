@@ -1,4 +1,4 @@
-from .attention import FlashAttentionRope
+from .attention import FlashAttentionRope, AttentionRopeFP8
 from .block import BlockRope
 from ..dinov2.layers import Mlp
 import torch.nn as nn
@@ -18,12 +18,14 @@ class TransformerDecoder(nn.Module):
         rope=None,
         need_project=True,
         use_checkpoint=False,
+        use_fp8_attention: bool = False,
     ):
         super().__init__()
 
         self.projects = nn.Linear(in_dim, dec_embed_dim) if need_project else nn.Identity()
         self.use_checkpoint = use_checkpoint
 
+        attn_impl = AttentionRopeFP8 if use_fp8_attention else FlashAttentionRope
         self.blocks = nn.ModuleList([
             BlockRope(
                 dim=dec_embed_dim,
@@ -39,7 +41,7 @@ class TransformerDecoder(nn.Module):
                 init_values=None,
                 qk_norm=False,
                 # attn_class=MemEffAttentionRope,
-                attn_class=FlashAttentionRope,
+                attn_class=attn_impl,
                 rope=rope
             ) for _ in range(depth)])
 

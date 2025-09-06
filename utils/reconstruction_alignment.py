@@ -141,15 +141,20 @@ def align_and_refine_reconstructions(recon_ref: pt.sfm.Reconstruction,
         ba_options.use_inner_iterations = False
         ba_options.use_mixed_precision_solves = True
         ba_options.max_num_refinement_iterations = 1
+        ba_options.verbose = True
         ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
         ba_options.preconditioner_type = pt.sfm.PreconditionerType.IDENTITY
         ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
+        ba_options.dense_linear_algebra_library_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE
+
         if use_inverse_depth:
             ba_options.use_homogeneous_point_parametrization = False
             ba_options.use_inverse_depth_parametrization = True
         else:
             ba_options.use_homogeneous_point_parametrization = True
             ba_options.use_inverse_depth_parametrization = False
+            
         ba_options.verbose = False
         ba_options.robust_loss_width = 3.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER

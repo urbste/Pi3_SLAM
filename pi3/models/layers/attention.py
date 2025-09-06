@@ -15,9 +15,18 @@ import time
 from torch import Tensor
 from torch import nn
 import torch
+import torch.nn.functional as F
 
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import SDPBackend
+
+# Optional Transformer Engine for FP8
+try:
+    import transformer_engine.pytorch as te  # type: ignore
+    from transformer_engine.common import recipe as te_recipe  # type: ignore
+    TE_AVAILABLE = True
+except Exception:
+    TE_AVAILABLE = False
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
@@ -396,6 +405,121 @@ class FlashAttentionRope(AttentionRope):
             x = u_a(x)
 
         return x
+
+
+class AttentionRopeFP8(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        qk_norm: bool = False,
+        norm_layer: nn.Module = nn.LayerNorm,
+        rope=None,
+        fp8_recipe=None,
+    ) -> None:
+        super().__init__()
+        if not TE_AVAILABLE:
+            raise ImportError("Transformer Engine is required for AttentionRopeFP8. Please install 'transformer_engine'.")
+
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        # Replace Linear with TE Linear for FP8 support
+        self.qkv = te.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = te.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.q_norm = norm_layer(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(head_dim) if qk_norm else nn.Identity()
+
+        self.rope = rope
+
+        # Default FP8 recipe
+        self.fp8_recipe = fp8_recipe if fp8_recipe is not None else (
+            te_recipe.DelayedScaling(margin=0, fp8_format=te_recipe.Format.E4M3) if TE_AVAILABLE else None
+        )
+
+    def forward(self, x: Tensor, attn_bias=None, xpos=None, global_merging=None, merge_funcs=None) -> Tensor:
+        if not TE_AVAILABLE:
+            raise RuntimeError("Transformer Engine is not available for FP8 attention forward path.")
+
+        B, N, C = x.shape
+
+        with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
+
+            q, k, v = unbind(qkv, 2)
+            q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+
+            if self.rope is not None:
+                q = self.rope(q, xpos)
+                k = self.rope(k, xpos)
+
+            # Apply token merging if enabled for global attention (mirror FlashAttentionRope)
+            merge_num = list(range(36))
+            merging_enabled = merge_funcs is not None
+            m_a, u_a = merge_funcs if merge_funcs is not None else (None, None)
+            is_global_attention = global_merging is not None and global_merging % 2 == 1
+
+            if global_merging is not None and global_merging in merge_num and is_global_attention:
+                if m_a is not None and u_a is not None:
+                    B_q, H_q, N_q, D_q = q.shape
+                    q_merge_in = q.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+                    k_merge_in = k.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+                    v_merge_in = v.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+
+                    q_out, k_out, v_out = m_a(
+                        q_merge_in,
+                        mode="mean",
+                        extra_tensors=k_merge_in,
+                        extra_tensors_2=v_merge_in,
+                    )
+
+                    del q_merge_in, k_merge_in, v_merge_in
+                    torch.cuda.empty_cache()
+
+                    N_m = q_out.shape[1]
+                    q = q_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+                    k = k_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+                    v = v_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+
+                    del q_out, k_out, v_out
+                    torch.cuda.empty_cache()
+                    merging_enabled = True
+
+            # Use SDPA kernels as in FlashAttentionRope
+            if q.dtype == torch.bfloat16:
+                with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    x = scaled_dot_product_attention(q, k, v)
+            else:
+                with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+                    x = scaled_dot_product_attention(q, k, v)
+                
+            del q, k, v
+            torch.cuda.empty_cache()
+
+            x = x.transpose(1, 2).reshape(B, -1, C)
+
+            # if x is not divisible by 8, pad with zeros, FP8 requires this
+            HWN = x.shape[1]
+            if HWN % 8 != 0:
+                x = F.pad(x, (0, 0, 0, 8 - HWN % 8))
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            
+            # unpad 
+            x = x[:, :HWN,:]
+
+            if global_merging is not None and global_merging in merge_num and u_a is not None:
+                x = u_a(x)
+
+            return x
 
 def get_attn_score(blk_class, x, frame_num, token_length, xpos=None):
     x = blk_class.norm1(x)
