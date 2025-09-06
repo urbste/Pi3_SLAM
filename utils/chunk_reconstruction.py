@@ -130,7 +130,7 @@ class ChunkPTRecon:
                 points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
-                masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
+                # masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
                 #descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
 
                 # Create tracks for this frame

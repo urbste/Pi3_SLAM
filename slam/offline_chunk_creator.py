@@ -64,7 +64,11 @@ class OfflineChunkCreator:
         # Load Pi3
         self.model: Pi3 = Pi3.from_pretrained(self.config.model_path).to(self.config.device).eval()
 
-        self.model = torch.compile(self.model)
+        self.model.do_global_merging = True
+        self.model.merging = 0
+        self.model.merge_ratio = 0.9
+
+        # self.model = torch.compile(self.model)
 
         # Load MoGe if requested
         self.moge_model = None

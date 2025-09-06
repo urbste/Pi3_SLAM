@@ -15,16 +15,92 @@ import torch
 import numpy as np
 import pytheia as pt
 import time
+import multiprocessing as mp
 from pi3.utils.basic import write_ply
 
 from utils.chunk_reconstruction import ChunkPTRecon
 from utils.reconstruction_alignment import create_view_graph_matches, align_and_refine_reconstructions
 
 
+def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool]) -> Dict:
+    """Top-level worker to reconstruct a single chunk and persist to disk.
+
+    Args:
+        args: Tuple of (chunk_index, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth)
+
+    Returns:
+        Dict with result metadata: {'idx', 'sfm_path', 'ply_path', 'num_frames', 'duration_s', 'fps', 'error'}
+    """
+    idx, chunk_path, recon_dir, max_obs_per_track, use_inverse_depth, write_ply_flag = args
+    t0 = time.time()
+    sfm_path = os.path.join(recon_dir, f"chunk_{idx:06d}.sfm")
+    ply_path = os.path.join(recon_dir, f"chunk_{idx:06d}.ply")
+
+    try:
+        # Load data
+        data: Dict = torch.load(chunk_path, map_location='cpu')
+
+        # Determine target size
+        H = int(data.get('original_height', 0) or (int(data['images'].shape[-2]) if 'images' in data and data['images'] is not None else 1080))
+        W = int(data.get('original_width', 0) or (int(data['images'].shape[-1]) if 'images' in data and data['images'] is not None else 1920))
+
+        # Ensure intrinsics if camera_params present
+        if 'camera_params' in data and data['camera_params'] is not None:
+            data['intrinsics'] = data['camera_params'].get('intrinsics', None)
+
+        # Build reconstruction
+        reconstructor = ChunkPTRecon()
+        reconstructor.set_target_size(W, H)
+        recon = reconstructor.create_recon_from_chunk(
+            data,
+            max_observations_per_track=max_obs_per_track,
+            use_inverse_depth=use_inverse_depth,
+        )
+
+        # Save SFM
+        pt.io.WriteReconstruction(recon, sfm_path)
+        # Optionally save PLY
+        if write_ply_flag:
+            color = [255, 255, 255]
+            pt.io.WritePlyFile(ply_path, recon, color, 1)
+
+        # Metrics
+        try:
+            if 'keypoints' in data and data['keypoints'] is not None:
+                num_frames = int(data['keypoints'].shape[0])
+            else:
+                num_frames = int(data['camera_poses'].shape[0])
+        except Exception:
+            num_frames = 0
+
+        dt = max(1e-6, time.time() - t0)
+        fps = (num_frames / dt) if num_frames > 0 else 0.0
+
+        return {
+            'idx': idx,
+            'sfm_path': sfm_path,
+            'ply_path': (ply_path if write_ply_flag else None),
+            'num_frames': num_frames,
+            'duration_s': dt,
+            'fps': fps,
+            'error': None,
+        }
+    except Exception as e:
+        return {
+            'idx': idx,
+            'sfm_path': None,
+            'ply_path': None,
+            'num_frames': 0,
+            'duration_s': time.time() - t0,
+            'fps': 0.0,
+            'error': f"{type(e).__name__}: {e}",
+        }
+
+
 class OfflineReconstructor:
     def __init__(self, chunk_dir: str, output_dir: str, chunk_length: Optional[int] = None, 
                  overlap: Optional[int] = None, max_observations_per_track: int = 5, save_per_chunk: bool = False,
-                 use_inverse_depth: bool = False):
+                 use_inverse_depth: bool = False, num_workers: Optional[int] = None):
         self.chunk_dir = chunk_dir
         self.output_dir = output_dir
 
@@ -47,6 +123,7 @@ class OfflineReconstructor:
         self.max_observations_per_track = max_observations_per_track
         self.save_per_chunk = save_per_chunk
         self.use_inverse_depth = use_inverse_depth
+        self.num_workers = int(num_workers) if num_workers is not None else max(1, (os.cpu_count() or 1))
 
         os.makedirs(self.output_dir, exist_ok=True)
         self.recon_dir = os.path.join(self.output_dir, 'reconstructions')
@@ -104,32 +181,48 @@ class OfflineReconstructor:
 
     def run(self) -> None:
         chunk_files = self._load_chunks()
-        print(f"🔄 Reconstructing {len(chunk_files)} chunks from {self.chunk_dir}")
+        num_chunks = len(chunk_files)
+        print(f"🔄 Reconstructing {num_chunks} chunks from {self.chunk_dir}")
 
-        for idx, path in enumerate(chunk_files):
-            print(f"\n📦 Loading {os.path.basename(path)} ({idx+1}/{len(chunk_files)})")
-            data: Dict = torch.load(path, map_location='cpu')
-
-            # Build per-chunk reconstruction
-            t0 = time.time()
-            recon = self._create_reconstruction_from_chunk(data)
-            dt = max(1e-6, time.time() - t0)
-            try:
-                if 'keypoints' in data and data['keypoints'] is not None:
-                    num_frames = int(data['keypoints'].shape[0])
+        # Stage 1: parallel per-chunk reconstruction -> write SFM (and optional PLY) to disk
+        print(f"🚀 Launching {self.num_workers} workers for per-chunk reconstruction...")
+        tasks = [
+            (idx, path, self.recon_dir, self.max_observations_per_track, self.use_inverse_depth, self.save_per_chunk)
+            for idx, path in enumerate(chunk_files)
+        ]
+        results_by_idx: Dict[int, Dict] = {}
+        with mp.Pool(processes=self.num_workers) as pool:
+            for res in pool.imap_unordered(_reconstruct_chunk_worker, tasks):
+                idx = res['idx']
+                results_by_idx[idx] = res
+                if res['error'] is None:
+                    print(f"   ✅ Chunk {idx+1}/{num_chunks}: ⏱️ {res['duration_s']:.3f}s for {res['num_frames']} frames -> {res['fps']:.2f} FPS")
                 else:
-                    num_frames = int(data['camera_poses'].shape[0])
-            except Exception:
-                num_frames = 0
-            fps = (num_frames / dt) if num_frames > 0 else 0.0
-            print(f"   ⏱️ Reconstruction: {dt:.3f}s for {num_frames} frames  ->  {fps:.2f} FPS")
+                    print(f"   ❌ Chunk {idx+1}/{num_chunks} failed: {res['error']}")
+
+        # Stage 2: sequential load + alignment
+        print("\n🔗 Aligning reconstructions sequentially...")
+        for idx in range(num_chunks):
+            res = results_by_idx.get(idx)
+            if res is None or res.get('sfm_path') is None:
+                print(f"   ⚠️ Skipping chunk {idx}: no reconstruction available")
+                continue
+
+            # Load reconstruction from disk
+            try:
+                success, recon = pt.io.ReadReconstruction(res['sfm_path'])
+                if not success:
+                    print(f"   ❌ Failed to load reconstruction for chunk {idx}: {recon}")
+                    continue
+            except Exception as e:
+                print(f"   ❌ Failed to load reconstruction for chunk {idx}: {e}")
+                continue
+
             self.reconstructions.append(recon)
-            if self.save_per_chunk:
-                self._save_chunk_reconstruction(recon, idx)
 
             # Align with previous
             if idx > 0:
-                print("   🔗 Aligning with previous reconstruction...")
+                print(f"   🔗 Aligning chunk {idx} with previous reconstruction...")
                 self._align_last_two()
 
         # Export final results: combined PLY and TUM trajectory

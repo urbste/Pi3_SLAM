@@ -317,11 +317,7 @@ class Pi3SLAMOnline:
         
         # Pytheia reconstructions storage (in-memory)
         self.chunk_reconstructions = []
-        
-        # Reconstruction alignment settings
-        self.save_transformed_reconstructions = False  # Save PLY files of transformed reconstructions
-        self.save_debug_reconstructions = False  # Save debug files for all reconstruction stages
-        
+
         # Camera trajectory tracking
         self.full_camera_trajectory = []
         self.full_camera_orientations = []

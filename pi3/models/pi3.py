@@ -18,8 +18,18 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             self,
             pos_type='rope100',
             decoder_size='large',
+            global_merging=True,
+            merging=0,
+            merge_ratio=0.9,
         ):
         super().__init__()
+
+        # ----------------------
+        #   Token Merging Config
+        # ----------------------
+        self.do_global_merging = global_merging
+        self.merging = merging
+        self.merge_ratio = merge_ratio
 
         # ----------------------
         #        Encoder
@@ -152,6 +162,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pos = pos + 1
             pos_special = torch.zeros(B * N, self.patch_start_idx, 2).to(hidden.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
+        
+        # Pre-calculate merging functions if merging is enabled
+        merging_functions = {}
+        if self.do_global_merging and self.merging is not None:
+            merging_functions = self._precalculate_merging_functions(hidden, N, H, W)
        
         for i in range(len(self.decoder)):
             blk = self.decoder[i]
@@ -159,16 +174,94 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             if i % 2 == 0:
                 pos = pos.reshape(B*N, hw, -1)
                 hidden = hidden.reshape(B*N, hw, -1)
+                merge_funcs = None
+                global_merging = None
             else:
                 pos = pos.reshape(B, N*hw, -1)
                 hidden = hidden.reshape(B, N*hw, -1)
-
-            hidden = blk(hidden, xpos=pos)
+                # Global attention - apply merging if enabled
+                if self.do_global_merging:
+                    if self.merging is None:
+                        global_merging = i  # Pass block number even when merging disabled
+                        merge_funcs = None
+                    elif self.do_global_merging and i >= self.merging:
+                        global_merging = i
+                        merge_funcs = merging_functions.get(i, None)
+                    else:
+                        global_merging = i  # Pass block number even when merging disabled
+                        merge_funcs = None
+                else:
+                    global_merging = None
+            
+            hidden = blk(hidden, xpos=pos, global_merging=global_merging, merge_funcs=merge_funcs)
+            
+            # Additional cleanup every few blocks
+            if i % 6 == 0:  # Every 6 blocks
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if i+1 in [len(self.decoder)-1, len(self.decoder)]:
-                final_output.append(hidden.reshape(B*N, hw, -1))
+                final_output.append(hidden.reshape(B*N, hw, -1).detach().cpu())
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B*N, hw, -1)
+    
+    def _precalculate_merging_functions(self, hidden, N, H, W):
+        """Pre-calculate merging functions once for the first global attention block."""
+        B = hidden.shape[0] // N
+        hw = hidden.shape[1]
+        
+        # Calculate grid dimensions
+        w, h = H // 14, W // 14
+        tokens_per_frame = w * h
+        num_frames = N
+        
+        # Check if we have the expected token structure
+        if (tokens_per_frame * num_frames + 5*num_frames)/N != hidden.shape[1]:
+            return {}
+        
+        # Only calculate merging functions once for the first global attention block
+        first_global_block = None
+        for i in range(1, len(self.decoder), 2):  # Only odd-numbered blocks (global attention)
+            if i >= self.merging:
+                first_global_block = i
+                break
+        
+        if first_global_block is None:
+            return {}
+        
+        # Reshape for global attention
+        hidden_global = hidden.reshape(B, N*hw, -1)
+        
+        # Import merging functions
+        from ..merging.merge import token_merge_pi3
+        
+        # Calculate merging parameters
+        generator = torch.Generator(device=hidden.device)
+        generator.manual_seed(33)
+        r = int(hidden_global.shape[1] * self.merge_ratio)
+        print(f"We reduce the token count from {hidden_global.shape[1]} to {hidden_global.shape[1] - r} for global attention.")
+        
+        try:
+            m_a, u_a = token_merge_pi3(
+                hidden_global, w, h, 2, 2, r, False, generator, enable_protection=True
+            )
+            
+            # Create merging functions for all global attention blocks
+            merging_functions = {}
+            for i in range(1, len(self.decoder), 2):  # All odd-numbered blocks (global attention)
+                if i >= self.merging:
+                    merging_functions[i] = (m_a, u_a)
+            
+            # Force garbage collection after pre-calculation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            return merging_functions
+            
+        except Exception as e:
+            return {}
     
     def forward(self, imgs):
         imgs = (imgs - self.image_mean) / self.image_std
@@ -178,39 +271,58 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         
         # encode by dinov2
         imgs = imgs.reshape(B*N, _, H, W)
+        # load encoder to cuda if on cpu
+        self.encoder = self.encoder.cuda()
         hidden = self.encoder(imgs, is_training=True)
+        # free memory
+        self.encoder = self.encoder.cpu()
+
+        del imgs
+        torch.cuda.empty_cache()
 
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
 
+        self.decoder = self.decoder.cuda()
+
         hidden, pos = self.decode(hidden, N, H, W)
+        hidden = hidden.to(pos.device)
+        # free memory
+        self.decoder = self.decoder.cpu()
 
+        # cleanup cuda cache
+        torch.cuda.empty_cache()
+
+        # local points
         point_hidden = self.point_decoder(hidden, xpos=pos)
+        point_hidden = point_hidden
+        ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+        del point_hidden
+        torch.cuda.empty_cache()
+
+        xy, z = ret.split([2, 1], dim=-1)
+        z = torch.exp(z)
+        local_points = torch.cat([xy * z, z], dim=-1)
+
+        # confidence
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
+        conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+        del conf_hidden
+        torch.cuda.empty_cache()
+
+        # camera
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
+        camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
+        del camera_hidden
+        torch.cuda.empty_cache()
 
-        with torch.amp.autocast(device_type='cuda', enabled=False):
-            # local points
-            point_hidden = point_hidden.float()
-            ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-            xy, z = ret.split([2, 1], dim=-1)
-            z = torch.exp(z)
-            local_points = torch.cat([xy * z, z], dim=-1)
+        # unproject local points using camera poses
+        points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
 
-            # confidence
-            conf_hidden = conf_hidden.float()
-            conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-
-            # camera
-            camera_hidden = camera_hidden.float()
-            camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
-
-            # unproject local points using camera poses
-            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
-
+            
         return dict(
-            points=points,
-            local_points=local_points,
-            conf=conf,
-            camera_poses=camera_poses,
+            points=points.float(),
+            local_points=local_points.float(),
+            conf=conf.float(),
+            camera_poses=camera_poses.float(),
         )

@@ -10,6 +10,7 @@
 import logging
 import os
 import warnings
+import time
 
 from torch import Tensor
 from torch import nn
@@ -106,7 +107,8 @@ class FlashAttention(Attention):
             with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
                 x = scaled_dot_product_attention(q, k, v)
 
-        x = x.transpose(1, 2).reshape([B, N, C])
+        # Use the actual shape after merging/unmerging
+        x = x.transpose(1, 2).reshape(B, -1, C)
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -321,17 +323,58 @@ class MemEffAttentionRope(AttentionRope):
 
     
 class FlashAttentionRope(AttentionRope):
-    def forward(self, x: Tensor, attn_bias=None, xpos=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, xpos=None, global_merging=None, merge_funcs=None) -> Tensor:
         B, N, C = x.shape
+        
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
-
-        # q, k, v = unbind(qkv, 2)
-        q, k, v = [qkv[:,:,i] for i in range(3)]
+        q, k, v = unbind(qkv, 2)
+        # q, k, v = [qkv[:,:,i] for i in range(3)]
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
 
         if self.rope is not None:
             q = self.rope(q, xpos)
             k = self.rope(k, xpos)
+
+        # Apply token merging if enabled for global attention
+        merge_num = list(range(36))  # PI3 has 36 decoder blocks
+        merging_enabled = merge_funcs is not None
+        m_a, u_a = merge_funcs if merge_funcs is not None else (None, None)
+
+        # Check if this is a global attention block (odd-numbered blocks)
+        is_global_attention = global_merging is not None and global_merging % 2 == 1
+
+        if global_merging is not None and global_merging in merge_num and is_global_attention:
+            # Use pre-calculated merging functions if available
+            
+            # Apply merging if we have functions
+            if m_a is not None and u_a is not None:
+                
+                # Apply merging to q, k, v
+                B_q, H_q, N_q, D_q = q.shape
+                q_merge_in = q.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+                k_merge_in = k.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+                v_merge_in = v.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+                
+                q_out, k_out, v_out = m_a(
+                    q_merge_in,
+                    mode="mean",
+                    extra_tensors=k_merge_in,
+                    extra_tensors_2=v_merge_in,
+                )
+                
+                del q_merge_in, k_merge_in, v_merge_in
+                torch.cuda.empty_cache()
+
+                N_m = q_out.shape[1]
+                q = q_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+                k = k_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+                v = v_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+
+                del q_out, k_out, v_out
+                
+                torch.cuda.empty_cache()
+
+                merging_enabled = True
 
         if q.dtype == torch.bfloat16:
             with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -340,10 +383,18 @@ class FlashAttentionRope(AttentionRope):
             with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
                 x = scaled_dot_product_attention(q, k, v)
 
-        x = x.transpose(1, 2).reshape([B, N, C])
+        del q, k, v
+        torch.cuda.empty_cache()
 
+        # Use the actual shape after merging/unmerging
+        x = x.transpose(1, 2).reshape(B, -1, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        
+        # Timing for unmerging
+        if global_merging is not None and global_merging in merge_num and u_a is not None:
+            x = u_a(x)
+
         return x
 
 def get_attn_score(blk_class, x, frame_num, token_length, xpos=None):

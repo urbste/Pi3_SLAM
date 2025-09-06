@@ -6,8 +6,8 @@ output_dir="logs/7scenes"
 groundtruth_dir="scripts/groundtruths/7scenes"
 
 # Defaults
-overlap=5
-chunk_length=50
+overlap=10
+chunk_length=100
 mode="offline"    # offline | online
 viz_port_base=8080 # used for online mode
 
@@ -92,7 +92,7 @@ if [[ "$mode" == "offline" ]]; then
             --device cuda \
             --metric-depth \
             --keypoints grid \
-            --max-kp 400 \
+            --max-kp 300 \
             --estimate-intrinsics \
             --num-workers 2 
 

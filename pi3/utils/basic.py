@@ -5,10 +5,12 @@ import cv2
 from PIL import Image
 import torch
 from torchvision import transforms
-from plyfile import PlyData, PlyElement
 import numpy as np
 import natsort
+import psutil
+import time
 from typing import Optional, Tuple, Dict, Any
+import open3d as o3d
 
 # Import undistortion utilities
 from .undistortion import UndistortionMaps, create_undistortion_maps_from_file, create_undistortion_maps_from_files, UndistortionImageLoader, VideoUndistortionLoader
@@ -23,7 +25,8 @@ except ImportError:
 
 
 def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000, 
-                         undistortion_maps: Optional[UndistortionMaps] = None):
+                         undistortion_maps: Optional[UndistortionMaps] = None,
+                         max_images: Optional[int] = None):
     """
     Loads images from a directory or video, resizes them to a uniform size,
     then converts and stacks them into a single [N, 3, H, W] PyTorch tensor.
@@ -33,6 +36,7 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
         interval: Sampling interval for frames
         PIXEL_LIMIT: Maximum number of pixels per image
         undistortion_maps: Optional UndistortionMaps object for applying undistortion
+        max_images: Maximum number of images to load (None for no limit)
     """
     sources = [] 
     
@@ -40,7 +44,18 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
     if osp.isdir(path):
         print(f"Loading images from directory: {path}")
         filenames = natsort.natsorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        for i in range(0, len(filenames), interval):
+        
+        # Calculate how many images to load based on max_images and interval
+        if max_images is not None:
+            # Calculate the maximum index to load
+            max_index = min(len(filenames), max_images * interval)
+            print(f"Limiting to {max_images} images (loading every {interval}th image)")
+        else:
+            max_index = len(filenames)
+        
+        for i in range(0, max_index, interval):
+            if max_images is not None and len(sources) >= max_images:
+                break
             img_path = osp.join(path, filenames[i])
             try:
                 sources.append(Image.open(img_path).convert('RGB'))
@@ -57,6 +72,8 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
                 total_frames = decoder.metadata.num_frames
                 
                 for frame_idx in range(0, total_frames, interval):
+                    if max_images is not None and len(sources) >= max_images:
+                        break
                     try:
                         # Load frame using torchcodec
                         frame_tensor = decoder[frame_idx]  # Shape: [C, H, W], uint8
@@ -80,6 +97,8 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
                     raise IOError(f"Cannot open video file: {path}")
                 frame_idx = 0
                 while True:
+                    if max_images is not None and len(sources) >= max_images:
+                        break
                     ret, frame = cap.read()
                     if not ret: break
                     if frame_idx % interval == 0:
@@ -94,6 +113,8 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
                 raise IOError(f"Cannot open video file: {path}")
             frame_idx = 0
             while True:
+                if max_images is not None and len(sources) >= max_images:
+                    break
                 ret, frame = cap.read()
                 if not ret: break
                 if frame_idx % interval == 0:
@@ -378,41 +399,47 @@ def write_ply(
     xyz,
     rgb=None,
     path='output.ply',
-    max_points=None,  # New parameter
+    max_points=None,
+    normals=None,
+    colors_from_coords=True,
 ) -> None:
     """
-    Write point cloud data to a PLY file.
+    Write point cloud data to a PLY file using Open3D.
     
     Args:
         xyz (torch.Tensor or np.ndarray): Point coordinates of shape (..., 3)
         rgb (torch.Tensor or np.ndarray, optional): RGB colors of shape (..., 3)
         path (str): Output file path
         max_points (int, optional): If set, randomly sample up to max_points
+        normals (torch.Tensor or np.ndarray, optional): Normal vectors of shape (..., 3)
+        colors_from_coords (bool): If True and rgb is None, generate colors from coordinates
     """
+    # Convert to numpy arrays
     if torch.is_tensor(xyz):
         xyz = xyz.detach().cpu().numpy()
-
     if torch.is_tensor(rgb):
         rgb = rgb.detach().cpu().numpy()
+    if torch.is_tensor(normals):
+        normals = normals.detach().cpu().numpy()
 
-    if rgb is not None and rgb.max() > 1:
-        rgb = rgb / 255.
-
+    # Reshape to (N, 3)
     xyz = rotate_target_dim_to_last_axis(xyz, 3)
     xyz = xyz.reshape(-1, 3)
+    
+    if normals is not None:
+        normals = rotate_target_dim_to_last_axis(normals, 3)
+        normals = normals.reshape(-1, 3)
 
+    # Handle RGB colors
     if rgb is not None:
         rgb = rotate_target_dim_to_last_axis(rgb, 3)
         rgb = rgb.reshape(-1, 3)
-
-    # Add random sampling if max_points is specified
-    if max_points is not None and xyz.shape[0] > max_points:
-        indices = np.random.choice(xyz.shape[0], max_points, replace=False)
-        xyz = xyz[indices]
-        if rgb is not None:
-            rgb = rgb[indices]
-    
-    if rgb is None:
+        
+        # Normalize RGB values to [0, 1] if they're in [0, 255]
+        if rgb.max() > 1:
+            rgb = rgb / 255.0
+    elif colors_from_coords:
+        # Generate colors from coordinates using the same method as before
         min_coord = np.min(xyz, axis=0)
         max_coord = np.max(xyz, axis=0)
         normalized_coord = (xyz - min_coord) / (max_coord - min_coord + 1e-8)
@@ -439,24 +466,287 @@ def write_ply(
         rgb[cond] = np.hstack([c[cond], np.zeros_like(x[cond]), x[cond]])
         rgb = (rgb + m)
 
-    dtype = [
-        ("x", "f4"),
-        ("y", "f4"),
-        ("z", "f4"),
-        ("nx", "f4"),
-        ("ny", "f4"),
-        ("nz", "f4"),
-        ("red", "u1"),
-        ("green", "u1"),
-        ("blue", "u1"),
-    ]
-    normals = np.zeros_like(xyz)
-    elements = np.empty(xyz.shape[0], dtype=dtype)
-    attributes = np.concatenate((xyz, normals, rgb * 255), axis=1)
-    elements[:] = list(map(tuple, attributes))
-    vertex_element = PlyElement.describe(elements, "vertex")
-    ply_data = PlyData([vertex_element])
-    ply_data.write(path)
+    # Random sampling if max_points is specified
+    if max_points is not None and xyz.shape[0] > max_points:
+        indices = np.random.choice(xyz.shape[0], max_points, replace=False)
+        xyz = xyz[indices]
+        if rgb is not None:
+            rgb = rgb[indices]
+        if normals is not None:
+            normals = normals[indices]
+
+    # Create Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    
+    if rgb is not None:
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+    
+    if normals is not None:
+        pcd.normals = o3d.utility.Vector3dVector(normals)
+
+    # Write to file
+    o3d.io.write_point_cloud(path, pcd)
+
+
+def read_ply(path: str) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Read point cloud data from a PLY file using Open3D.
+    
+    Args:
+        path (str): Input file path
+        
+    Returns:
+        Tuple of (xyz, rgb, normals) where:
+        - xyz: Point coordinates of shape (N, 3)
+        - rgb: RGB colors of shape (N, 3) or None
+        - normals: Normal vectors of shape (N, 3) or None
+    """
+    pcd = o3d.io.read_point_cloud(path)
+    
+    xyz = np.asarray(pcd.points)
+    rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
+    normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+    
+    return xyz, rgb, normals
+
+
+def extract_colors_from_images(imgs: torch.Tensor, points: torch.Tensor, patch_size: int = 14) -> torch.Tensor:
+    """
+    Extract colors from input images and map them to 3D points.
+    
+    Args:
+        imgs: Input images tensor of shape (B, N, 3, H, W)
+        points: 3D points tensor of shape (B, N, H, W, 3)
+        patch_size: Patch size used by the model (default: 14)
+    
+    Returns:
+        colors: RGB colors tensor of shape (B*N*H*W, 3)
+    """
+    B, N, C, H, W = imgs.shape
+    Bh, Nh, Hh, Wh, _ = points.shape
+    
+    # Reshape images to (B*N, 3, H, W)
+    imgs_flat = imgs.reshape(B*N, C, H, W)
+
+    # Resize images to match the patch grid
+    imgs_resized = torch.nn.functional.interpolate(
+        imgs_flat, 
+        size=(Hh, Wh), 
+        mode='bilinear', 
+        align_corners=False
+    )
+    
+    # Reshape to (B*N, 3, Wh*Wh)
+    colors = imgs_resized.reshape(B*N, 3, -1).permute(0, 2, 1)  # (B*N, Wh*Wh, 3)
+    
+    # Flatten to (B*N*Wh*Wh, 3)
+    colors = colors.reshape(-1, 3)
+    
+    return colors
+
+
+def filter_points_by_confidence(points: torch.Tensor, confidence: torch.Tensor, 
+                               threshold: float = 0.7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Filter points by confidence threshold.
+    
+    Args:
+        points: 3D points tensor of shape (..., 3)
+        confidence: Confidence tensor of shape (...)
+        threshold: Confidence threshold (default: 0.7)
+    
+    Returns:
+        Tuple of (filtered_points, filtered_confidence, mask):
+        - filtered_points: Points with confidence > threshold
+        - filtered_confidence: Confidence values for filtered points
+        - mask: Boolean mask indicating which points were kept
+    """
+    # Flatten tensors
+    points_flat = points.reshape(-1, 3)
+    conf_flat = confidence.reshape(-1)
+    
+    # Create confidence mask
+    mask = conf_flat > threshold
+    
+    # Apply mask
+    filtered_points = points_flat[mask]
+    filtered_confidence = conf_flat[mask]
+    
+    return filtered_points, filtered_confidence, mask
+
+def create_camera_trajectory(camera_poses: torch.Tensor, 
+                           trajectory_scale: float = 0.1,
+                           show_orientations: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create camera trajectory points and colors for visualization.
+    
+    Args:
+        camera_poses: Camera pose matrices of shape (B, N, 4, 4)
+        trajectory_scale: Scale factor for camera orientation arrows
+        show_orientations: Whether to show camera orientations as arrows
+    
+    Returns:
+        Tuple of (trajectory_points, trajectory_colors):
+        - trajectory_points: 3D points for camera positions and orientations
+        - trajectory_colors: RGB colors for trajectory visualization
+    """
+    B, N, _, _ = camera_poses.shape
+    
+    # Extract camera positions (translation part)
+    camera_positions = camera_poses[:, :, :3, 3]  # Shape: (B, N, 3)
+    camera_positions = camera_positions.reshape(-1, 3)  # Shape: (B*N, 3)
+    
+    # Create camera position colors (red for visibility)
+    camera_colors = torch.zeros_like(camera_positions)
+    camera_colors[:, 0] = 1.0  # Red
+    
+    trajectory_points = [camera_positions]
+    trajectory_colors = [camera_colors]
+
+    # Combine all trajectory elements
+    all_trajectory_points = torch.cat(trajectory_points, dim=0)
+    all_trajectory_colors = torch.cat(trajectory_colors, dim=0)
+    
+    return all_trajectory_points, all_trajectory_colors
+
+def random_sample_points(points: torch.Tensor, colors: torch.Tensor, 
+                        max_points_per_image: int = 1000, 
+                        random_seed: int = 42) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Randomly sample a fixed number of points per image to reduce point cloud size.
+    
+    Args:
+        points: 3D points tensor of shape (B, N, H, W, 3)
+        colors: RGB colors tensor of shape (B*N*H*W, 3)
+        max_points_per_image: Maximum number of points to sample per image
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        Tuple of (sampled_points, sampled_colors, sample_mask):
+        - sampled_points: Randomly sampled points
+        - sampled_colors: Colors for sampled points
+        - sample_mask: Boolean mask indicating which points were sampled
+    """
+    import numpy as np
+    
+    B, N, H, W, _ = points.shape
+    
+    # Flatten points to (B*N*H*W, 3)
+    points_flat = points.reshape(-1, 3)
+    
+    # Calculate points per image
+    points_per_image = H * W
+    total_points = B * N * points_per_image
+    
+    # Determine how many points to sample per image
+    points_to_sample = min(max_points_per_image, points_per_image)
+    total_samples = B * N * points_to_sample
+    
+    print(f"Random sampling: {points_to_sample} points per image from {points_per_image} available")
+    print(f"Total reduction: {total_points} → {total_samples} ({total_samples/total_points*100:.1f}%)")
+    
+    # Set random seed for reproducibility
+    np.random.seed(random_seed)
+    
+    # Create sampling indices
+    sample_indices = []
+    for i in range(B * N):
+        # Get indices for this image
+        start_idx = i * points_per_image
+        
+        # Randomly sample indices for this image
+        image_indices = np.random.choice(
+            points_per_image, 
+            size=points_to_sample, 
+            replace=False
+        )
+        
+        # Convert to global indices
+        global_indices = start_idx + image_indices
+        sample_indices.extend(global_indices)
+    
+    sample_indices = np.array(sample_indices)
+    
+    # Sample points and colors
+    sampled_points = points_flat[sample_indices]
+    sampled_colors = colors[sample_indices]
+    
+    # Create mask for sampled points (on same device as input points)
+    sample_mask = torch.zeros(total_points, dtype=torch.bool, device=points.device)
+    sample_mask[sample_indices] = True
+    
+    return sampled_points, sampled_colors, sample_mask
+
+
+def get_memory_usage():
+    """Get current memory usage in MB."""
+    if torch.cuda.is_available():
+        # GPU memory
+        gpu_memory = torch.cuda.memory_allocated() / 1024**2  # MB
+        gpu_memory_max = torch.cuda.max_memory_allocated() / 1024**2  # MB
+        gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**2  # MB
+        return {
+            'gpu_allocated': gpu_memory,
+            'gpu_max_allocated': gpu_memory_max,
+            'gpu_reserved': gpu_memory_reserved,
+            'gpu_available': (torch.cuda.get_device_properties(0).total_memory / 1024**2) - gpu_memory_reserved
+        }
+    else:
+        # CPU memory
+        process = psutil.Process()
+        cpu_memory = process.memory_info().rss / 1024**2  # MB
+        return {
+            'cpu_memory': cpu_memory,
+            'cpu_available': psutil.virtual_memory().available / 1024**2
+        }
+
+
+def print_memory_usage(stage_name: str = ""):
+    """Print current memory usage."""
+    memory = get_memory_usage()
+    
+    if torch.cuda.is_available():
+        print(f"🔧 Memory Usage {stage_name}:")
+        print(f"   GPU Allocated: {memory['gpu_allocated']:.1f} MB")
+        print(f"   GPU Reserved: {memory['gpu_reserved']:.1f} MB")
+        print(f"   GPU Available: {memory['gpu_available']:.1f} MB")
+        print(f"   GPU Max Used: {memory['gpu_max_allocated']:.1f} MB")
+    else:
+        print(f"🔧 Memory Usage {stage_name}:")
+        print(f"   CPU Memory: {memory['cpu_memory']:.1f} MB")
+        print(f"   CPU Available: {memory['cpu_available']:.1f} MB")
+
+
+class MemoryProfiler:
+    """Context manager for profiling memory usage."""
+    
+    def __init__(self, stage_name: str = ""):
+        self.stage_name = stage_name
+        self.start_memory = None
+        self.start_time = None
+    
+    def __enter__(self):
+        self.start_time = time.time()
+        self.start_memory = get_memory_usage()
+        print(f"🚀 Starting {self.stage_name}...")
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        end_time = time.time()
+        end_memory = get_memory_usage()
+        
+        duration = end_time - self.start_time
+        
+        print(f"✅ Completed {self.stage_name} in {duration:.2f}s")
+        
+        if torch.cuda.is_available():
+            memory_diff = end_memory['gpu_allocated'] - self.start_memory['gpu_allocated']
+            print(f"   Memory change: {memory_diff:+.1f} MB")
+            print(f"   Peak memory: {end_memory['gpu_max_allocated']:.1f} MB")
+        else:
+            memory_diff = end_memory['cpu_memory'] - self.start_memory['cpu_memory']
+            print(f"   Memory change: {memory_diff:+.1f} MB")
 
 
 def load_video_frame_torchcodec(video_path: str, frame_idx: int, target_size: Optional[Tuple[int, int]] = None) -> torch.Tensor:

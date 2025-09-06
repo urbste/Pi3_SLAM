@@ -132,8 +132,8 @@ def main():
     
     # Processing options
     proc_group = parser.add_argument_group('⚙️ Processing Options')
-    proc_group.add_argument('--chunk_length', type=int, default=30, help='Number of frames per chunk')
-    proc_group.add_argument('--overlap', type=int, default=5, help='Number of overlapping frames between chunks')
+    proc_group.add_argument('--chunk_length', type=int, default=100, help='Number of frames per chunk')
+    proc_group.add_argument('--overlap', type=int, default=10, help='Number of overlapping frames between chunks')
     proc_group.add_argument('--conf_threshold', type=float,default=0.5, help='Confidence threshold for filtering points')
     proc_group.add_argument('--cam_scale', type=float, default=1.0, help='Scale factor for camera poses')
     
@@ -151,11 +151,11 @@ def main():
     
     # Reconstruction options
     recon_group = parser.add_argument_group('🔧 Reconstruction Options')
-    recon_group.add_argument('--save_chunk_reconstructions', action='store_true', default=False, 
+    recon_group.add_argument('--save_chunk_reconstructions', action='store_true', default=True, 
                             help='Save each chunk reconstruction to disk')
-    recon_group.add_argument('--save_transformed_reconstructions', action='store_true', default=False, 
+    recon_group.add_argument('--save_transformed_reconstructions', action='store_true', default=True, 
                             help='Save transformed reconstructions as PLY files')
-    recon_group.add_argument('--save_debug_reconstructions', action='store_true', default=False, 
+    recon_group.add_argument('--save_debug_reconstructions', action='store_true', default=True, 
                             help='Save debug files for all reconstruction stages')
     recon_group.add_argument('--save_debug_projections', action='store_true', default=False, 
                             help='Save debug projections as GIF files')
@@ -163,7 +163,7 @@ def main():
                             help='Maximum number of observations per track')
     recon_group.add_argument('--do_metric_depth', action='store_true', default=True, 
                             help='Use MoGe model to estimate metric depth')
-    recon_group.add_argument('--use_inverse_depth', action='store_true', default=False,
+    recon_group.add_argument('--use_inverse_depth', action='store_true', default=True,
                             help='Use inverse-depth parametrization in reconstruction (matches offline option)')
     
     # Visualization options
@@ -241,6 +241,9 @@ def main():
         model = Pi3.from_pretrained(args.model_path)
         model.to(args.device)
         model.eval()
+        model.do_global_merging = True
+        model.merging = 0
+        model.merge_ratio = 0.9
         print(f"✅ Model loaded successfully on {args.device}")
     except Exception as e:
         print(f"❌ Error loading model: {e}")
