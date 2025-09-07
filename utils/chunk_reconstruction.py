@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import cv2
 import os
+import time
 
 class ChunkPTRecon:
     """
@@ -48,7 +49,8 @@ class ChunkPTRecon:
         use_lk_refinement: bool = False, 
         lk_params: Optional[Dict] = None, 
         collect_debug: bool = False,
-        run_bundle_adjustment: bool = True) -> pt.sfm.Reconstruction:
+        run_bundle_adjustment: bool = True,
+        shared_intrinsics: bool = True) -> pt.sfm.Reconstruction:
         """
         Create PyTheia reconstruction from chunk data.
         
@@ -68,6 +70,8 @@ class ChunkPTRecon:
                 'win': (w, h), 'levels': int, 'criteria': (type, count, eps), 'max_deviation_px': float
             }
             collect_debug: If True, record projected vs final 2D points for debugging plots
+            run_bundle_adjustment: If True, run bundle adjustment
+            shared_intrinsics: If True, use same shared intrinsics for all chunks. we will set the first frame's intrinsics as the shared intrinsics
         
         Returns:
             PyTheia reconstruction object
@@ -95,6 +99,7 @@ class ChunkPTRecon:
             print(f"🔧 Creating PyTheia reconstruction from chunk: {num_frames} frames, no keypoints available")
 
         # Add cameras to reconstruction
+        t_add_cams0 = time.time()
         for frame_idx in range(num_frames):
             # Create view with actual image filename as name
             if 'image_paths' in chunk_data and chunk_data['image_paths']:
@@ -109,25 +114,18 @@ class ChunkPTRecon:
                 view_name = f"frame_{frame_idx}"
             
             timestamp_ns = frame_idx
-            view_id = self.reconstruction.AddView(view_name, frame_idx, timestamp_ns)
+            intrinsic_group_id = 0 if shared_intrinsics else frame_idx
+            view_id = self.reconstruction.AddView(view_name, intrinsic_group_id, timestamp_ns)
             view = self.reconstruction.MutableView(view_id)
             
             # Create camera
             camera = Camera()
             
             # Use provided intrinsics or create default ones
-            if 'intrinsics' in chunk_data:
-                intrinsics = chunk_data['intrinsics'][frame_idx]
+            if shared_intrinsics:
+                intrinsics = chunk_data['intrinsics'][0] #[frame_idx]
             else:
-                # Create default intrinsics (principal point at center)
-                fx = fy = max(self.original_width, self.original_height)
-                cx = self.original_width / 2
-                cy = self.original_height / 2
-                intrinsics = torch.tensor([
-                    [fx, 0, cx],
-                    [0, fy, cy],
-                    [0, 0, 1]
-                ])
+                intrinsics = chunk_data['intrinsics'][frame_idx]
             
             camera.create_from_intrinsics(intrinsics.cpu().numpy(), self.original_width, self.original_height, 1.0)
             
@@ -142,45 +140,45 @@ class ChunkPTRecon:
             view.SetIsEstimated(True)
             
             self.view_ids.append(view_id)
+        t_add_cams1 = time.time()
+        print(f"   ⏱️ Added {num_frames} cameras in {(t_add_cams1 - t_add_cams0):.3f}s")
         
         # Set camera intrinsics from priors
+        t_intr0 = time.time()
         pt.sfm.SetCameraIntrinsicsFromPriors(self.reconstruction)
+        t_intr1 = time.time()
+        print(f"   ⏱️ Set intrinsics from priors in {(t_intr1 - t_intr0):.3f}s")
         
         # Add tracks and observations only if keypoints are available
         if has_keypoints:
             for frame_idx in range(num_frames):
+                t_frame0 = time.time()
                 # Get 3D points and colors for this frame
                 points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
-                # masks = chunk_data['masks'][frame_idx].cpu().numpy()  # (num_keypoints, 1)
-                # descriptors = chunk_data['descriptors'][frame_idx].cpu().numpy()  # (num_keypoints, 128)
-
-                # Create tracks for this frame
-                frame_track_ids = []
                 
+                # Create tracks for this frame
+                t_tracks0 = time.time()
+                frame_track_ids = []
                 for kp_idx in range(keypoints_2d.shape[0]):
-                    
-                    # Create track
                     track_id = self.reconstruction.AddTrack()
                     track = self.reconstruction.MutableTrack(track_id)
-                    
-                    # Set 3D point (homogeneous)
                     track.SetPoint(np.hstack([points_3d[kp_idx], 1]))
-                    
-                    # Set color
                     track.SetColor(colors[kp_idx])
                     track.SetIsEstimated(True)
-                    #track.SetReferenceDescriptor(descriptors[kp_idx])
-                    
                     frame_track_ids.append(track_id)
-                    
-                    # Add observation for this frame
+                t_tracks1 = time.time()
+                
+                # Add observation for this frame
+                t_obs_self0 = time.time()
+                for kp_idx in range(keypoints_2d.shape[0]):
                     self.reconstruction.AddObservation(
                         self.view_ids[frame_idx], 
-                        track_id, 
+                        frame_track_ids[kp_idx], 
                         pt.sfm.Feature(keypoints_2d[kp_idx])
                     )
+                t_obs_self1 = time.time()
                 
                 # Project keypoints to subset of other frames
                 all_frames = [i for i in range(num_frames)]
@@ -190,10 +188,15 @@ class ChunkPTRecon:
                 all_frames = all_frames_before + all_frames_after
 
                 # Project points to all other frames
+                t_proj0 = time.time()
                 projected_points = self._project_points_to_other_cams(
                     chunk_data, frame_idx, all_frames
                 )
-
+                t_proj1 = time.time()
+                
+                added_obs = 0
+                t_lk_total = 0.0
+                t_obs_total = 0.0
                 if use_lk_refinement:
                     # Prepare Lucas–Kanade refinement inputs (grayscale uint8 images)
                     try:
@@ -215,11 +218,14 @@ class ChunkPTRecon:
                         final_points = projected_kps.copy()
 
                         if source_gray is not None and other_frame_idx in target_grays and target_grays[other_frame_idx] is not None:
+                            t_lk0 = time.time()
                             prev_pts = chunk_data['keypoints'][frame_idx].cpu().numpy().astype(np.float32).reshape(-1, 1, 2)
                             next_pts, status, _err = cv2.calcOpticalFlowPyrLK(
                                 source_gray, target_grays[other_frame_idx], prev_pts, None,
                                 winSize=lk_win, maxLevel=lk_levels, criteria=lk_criteria
                             )
+                            t_lk1 = time.time()
+                            t_lk_total += (t_lk1 - t_lk0)
                             if next_pts is not None and status is not None:
                                 next_pts = next_pts.reshape(-1, 2)
                                 status = status.reshape(-1)
@@ -228,11 +234,9 @@ class ChunkPTRecon:
                                     if status[kp_idx] == 1:
                                         lk_pt = next_pts[kp_idx]
                                         proj_pt = projected_kps[kp_idx]
-                                        
-                                        # accept LK if close to projection; otherwise keep projection
                                         if np.linalg.norm(lk_pt - proj_pt) <= deviation_thresh_px:
                                             final_points[kp_idx] = lk_pt
-                            
+                        
                         # Store for debug: projections vs final
                         if self._collect_debug:
                             try:
@@ -244,6 +248,7 @@ class ChunkPTRecon:
                                 pass
 
                         # Add observations for final points
+                        t_obs0 = time.time()
                         for kp_idx, (track_id, final_pt) in enumerate(zip(frame_track_ids, final_points)):
                             if (0 <= final_pt[0] < self.original_width and 
                                 0 <= final_pt[1] < self.original_height):
@@ -252,6 +257,9 @@ class ChunkPTRecon:
                                     track_id,
                                     pt.sfm.Feature(final_pt)
                                 )
+                                added_obs += 1
+                        t_obs1 = time.time()
+                        t_obs_total += (t_obs1 - t_obs0)
                 else:
                     # LK disabled: add observations from projected points only
                     for other_frame_idx, projected_kps in zip(all_frames, projected_points):
@@ -264,6 +272,7 @@ class ChunkPTRecon:
                                 }
                             except Exception:
                                 pass
+                        t_obs0 = time.time()
                         for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
                             if (0 <= projected_pt[0] < self.original_width and 
                                 0 <= projected_pt[1] < self.original_height):
@@ -272,6 +281,12 @@ class ChunkPTRecon:
                                     track_id,
                                     pt.sfm.Feature(projected_pt)
                                 )
+                                added_obs += 1
+                        t_obs1 = time.time()
+                        t_obs_total += (t_obs1 - t_obs0)
+
+                t_frame1 = time.time()
+                print(f"   Frame {frame_idx}: tracks {keypoints_2d.shape[0]} in {(t_tracks1 - t_tracks0):.3f}s, proj {(t_proj1 - t_proj0):.3f}s, LK {t_lk_total:.3f}s, obs {added_obs} in {t_obs_total:.3f}s, total {(t_frame1 - t_frame0):.3f}s")
 
         if self.use_inverse_depth:
             self.reconstruction.InitializeInverseDepth()
@@ -293,12 +308,13 @@ class ChunkPTRecon:
         ba_options.use_inner_iterations = False
         ba_options.use_mixed_precision_solves = False
         ba_options.max_num_refinement_iterations = 1
-        ba_options.verbose = True
-        ba_options.num_threads = 10
+        ba_options.verbose = False
+        ba_options.num_threads = 20
         ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
         ba_options.preconditioner_type = pt.sfm.PreconditionerType.JACOBI
         ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
-        ba_options.dense_linear_algebra_library_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        dense_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() and self.reconstruction.NumViews() > 100 else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        ba_options.dense_linear_algebra_library_type = dense_type
         ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE 
 
         if self.use_inverse_depth:

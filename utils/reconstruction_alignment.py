@@ -4,13 +4,9 @@ Reconstruction alignment utilities for finding common 3D points between subseque
 
 import numpy as np
 from typing import List, Tuple, Dict
+import torch
+import pytheia as pt
 
-try:
-    import pytheia as pt
-    PYTHEIA_AVAILABLE = True
-except ImportError:
-    PYTHEIA_AVAILABLE = False
-    print("⚠️  Warning: PyTheia not available, reconstruction alignment will be disabled")
 
 
 def create_view_graph_matches(chunk_size: int, overlap_size: int) -> List[Tuple[int, int]]:
@@ -145,7 +141,8 @@ def align_and_refine_reconstructions(recon_ref: pt.sfm.Reconstruction,
         ba_options.linear_solver_type = pt.sfm.LinearSolverType.DENSE_SCHUR
         ba_options.preconditioner_type = pt.sfm.PreconditionerType.IDENTITY
         ba_options.visibility_clustering_type = pt.sfm.VisibilityClusteringType.CANONICAL_VIEWS
-        ba_options.dense_linear_algebra_library_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        dense_type = pt.sfm.DenseLinearAlgebraLibraryType.CUDA if torch.cuda.is_available() and recon_qry.NumViews() > 100 else pt.sfm.DenseLinearAlgebraLibraryType.EIGEN
+        ba_options.dense_linear_algebra_library_type = dense_type
         ba_options.sparse_linear_algebra_library_type = pt.sfm.SparseLinearAlgebraLibraryType.SUITE_SPARSE
 
         if use_inverse_depth:
@@ -158,16 +155,8 @@ def align_and_refine_reconstructions(recon_ref: pt.sfm.Reconstruction,
         ba_options.verbose = False
         ba_options.robust_loss_width = 3.0
         ba_options.loss_function_type = pt.sfm.LossFunctionType.HUBER
-
-        # pt.io.WriteReconstruction(recon_qry, "recon_qry_before_ba.sfm")
         
         ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, recon_qry)
-        
-        # if use_inverse_depth:
-        #     ba_options.max_num_iterations = 2
-        #     ba_options.use_homogeneous_point_parametrization = True
-        #     ba_options.use_inverse_depth_parametrization = False
-        #     ba_summary = pt.sfm.BundleAdjustReconstruction(ba_options, recon_qry)
 
         print(f"   Bundle adjustment completed: Success={ba_summary.success}, "
               f"Final cost={ba_summary.final_cost:.6f}")

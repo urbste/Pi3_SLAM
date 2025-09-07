@@ -51,7 +51,10 @@ class OfflineCreatorConfig:
     do_fp8: bool = False
     do_attention_merge: bool = False
     merging_ratio: float = 0.8
-
+    compile_models: bool = False
+    pixel_limit: int = 255000
+    frame_stride: int = 1
+    
 torch._dynamo.config.capture_scalar_outputs = True
 
 class OfflineChunkCreator:
@@ -81,7 +84,9 @@ class OfflineChunkCreator:
             self.model.load_state_dict(weight, strict=False)
         else:
             self.model = Pi3.from_pretrained("yyfz233/Pi3").to(self.config.device).eval()
-        # self.model = torch.compile(self.model)
+        
+        if self.config.compile_models:
+            self.model = torch.compile(self.model)
 
         # Load MoGe if requested
         self.moge_model = None
@@ -89,7 +94,8 @@ class OfflineChunkCreator:
             try:
                 from moge.model.v2 import MoGeModel
                 self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vits-normal").to("cuda").eval()
-                self.moge_model = torch.compile(self.moge_model)
+                if self.config.compile_models:
+                    self.moge_model = torch.compile(self.moge_model)
                 print("   MoGe loaded for metric scaling")
             except Exception as e:
                 print(f"⚠️  Failed to initialize MoGe: {e}. Continuing without metric depth.")
@@ -183,111 +189,105 @@ class OfflineChunkCreator:
 
         num_frames = int(chunk_images.shape[1])
         with torch.no_grad():
-            t0_inf = time.time()
-            with torch.amp.autocast('cuda', dtype=dtype) if self.config.device.startswith('cuda') else torch.autocast(device_type='cpu', dtype=torch.float32):
-                pi3_result = self.model(chunk_images.to(self.config.device))
-            dt_inf = max(1e-6, time.time() - t0_inf)
-            fps = num_frames / dt_inf if num_frames > 0 else 0.0
-            print(f"   ⏱️ Inference: {dt_inf:.3f}s for {num_frames} frames  ->  {fps:.2f} FPS")
-            # stash metrics for aggregation
-            _metrics = {'infer_s': float(dt_inf), 'num_frames': int(num_frames), 'fps': float(fps)}
+             t0_inf = time.time()
+             with torch.amp.autocast('cuda', dtype=dtype) if self.config.device.startswith('cuda') else torch.autocast(device_type='cpu', dtype=torch.float32):
+                 pi3_result = self.model(chunk_images.to(self.config.device))
+             dt_inf = max(1e-6, time.time() - t0_inf)
+             fps = num_frames / dt_inf if num_frames > 0 else 0.0
+             print(f"   ⏱️ Inference: {dt_inf:.3f}s for {num_frames} frames  ->  {fps:.2f} FPS")
+             _metrics = {'infer_s': float(dt_inf), 'num_frames': int(num_frames), 'fps': float(fps)}
 
         # Compute masks
         masks = self._compute_masks(pi3_result)[0]
 
         # Optional MoGe metric scaling
         if self.moge_model is not None:
-            with torch.amp.autocast('cuda', dtype=dtype):
-                moge_metric_depth = self.moge_model.infer(chunk_images[0, 0].to("cuda"))["depth"]
-            pi3_metric_depth = pi3_result['local_points'][0, 0][..., 2]
-            mask0 = masks[0]
-            scale_factor = self._get_scale_factor_for_pi3(moge_metric_depth, pi3_metric_depth, mask0)
+             with torch.amp.autocast('cuda', dtype=dtype):
+                 moge_metric_depth = self.moge_model.infer(chunk_images[0, 0].to("cuda"))["depth"]
+             pi3_metric_depth = pi3_result['local_points'][0, 0][..., 2]
+             mask0 = masks[0]
+             scale_factor = self._get_scale_factor_for_pi3(moge_metric_depth, pi3_metric_depth, mask0)
 
-            pi3_result["local_points"] = pi3_result["local_points"] * scale_factor
-            pi3_result["points"] = pi3_result["points"] * scale_factor
-            pi3_result["camera_poses"][:, :, :3, 3] = pi3_result["camera_poses"][:, :, :3, 3] * scale_factor
-            pi3_result["camera_poses_cw"] = torch.linalg.inv(pi3_result["camera_poses"])
+             pi3_result["local_points"] = pi3_result["local_points"] * scale_factor
+             pi3_result["points"] = pi3_result["points"] * scale_factor
+             pi3_result["camera_poses"][:, :, :3, 3] = pi3_result["camera_poses"][:, :, :3, 3] * scale_factor
+             pi3_result["camera_poses_cw"] = torch.linalg.inv(pi3_result["camera_poses"])
 
         # Optional intrinsics estimation
         camera_params = None
         if self.config.estimate_camera_params:
-            try:
-                camera_params = estimate_camera_parameters_single_chunk(pi3_result)
-            except Exception as e:
-                print(f"⚠️  Camera parameter estimation failed: {e}")
-                camera_params = None
+             try:
+                 camera_params = estimate_camera_parameters_single_chunk(pi3_result)
+             except Exception as e:
+                 print(f"⚠️  Camera parameter estimation failed: {e}")
+             camera_params = camera_params if camera_params is not None else None
 
         # CPU result with dense maps needed for interpolation
         cpu_result = {
-            'points': pi3_result['points'][0].cpu(),
-            'local_points': pi3_result['local_points'][0].cpu(),
-            'camera_poses': pi3_result['camera_poses'][0].cpu(),
-            'conf': pi3_result['conf'][0].cpu(),
-            'masks': masks.cpu(),
-            'image_paths': chunk_paths,
-            'images': chunk_images.squeeze(0).cpu(),
-            '_metrics': _metrics,
+             'points': pi3_result['points'][0].cpu(),
+             'local_points': pi3_result['local_points'][0].cpu(),
+             'camera_poses': pi3_result['camera_poses'][0].cpu(),
+             'conf': pi3_result['conf'][0].cpu(),
+             'masks': masks.cpu(),
+             'image_paths': chunk_paths,
+             'images': chunk_images.squeeze(0).cpu(),
+             '_metrics': _metrics,
         }
 
         if camera_params is not None:
-            cpu_result['camera_params'] = {k: v.cpu() for k, v in camera_params.items()}
+             cpu_result['camera_params'] = {k: v.cpu() for k, v in camera_params.items()}
 
         # Provide size info for downstream consumers
         if self.target_size is not None:
-            cpu_result['original_width'] = self.target_size[1]
-            cpu_result['original_height'] = self.target_size[0]
+             cpu_result['original_width'] = self.target_size[1]
+             cpu_result['original_height'] = self.target_size[0]
 
         # Keypoint extraction (if enabled)
         if self.keypoint_extractor is not None:
-            try:
-                kp_res = self.keypoint_extractor.extract_with_colors(chunk_images)
-                # Interpolate 3D/world at keypoints using dense maps
-                interp = self._interpolate_world_points_for_keypoints(cpu_result, kp_res['keypoints'])
-
-                # Replace dense maps with per-keypoint results for storage efficiency
-                cpu_result['points'] = interp['points'].to(torch.float16)
-                cpu_result['local_points'] = interp['local_points'].to(torch.float16)
-                cpu_result['conf'] = interp['conf'].to(torch.float16)
-                cpu_result['masks'] = interp['masks']
-                # Save keypoints so reconstructor can add track observations and project to neighbors
-                cpu_result['keypoints'] = kp_res['keypoints'].to(torch.float16).cpu()
-                if kp_res.get('descriptors') is not None:
-                    cpu_result['descriptors'] = kp_res['descriptors'].to(torch.float16)
-                if kp_res.get('scores') is not None:
-                    cpu_result['scores'] = kp_res['scores'].to(torch.float16)
-                cpu_result['colors'] = kp_res['colors'].to(torch.float16)
-            except Exception as e:
-                print(f"⚠️  Keypoint extraction failed: {e}")
+             try:
+                 kp_res = self.keypoint_extractor.extract_with_colors(chunk_images)
+                 interp = self._interpolate_world_points_for_keypoints(cpu_result, kp_res['keypoints'])
+                 cpu_result['points'] = interp['points'].to(torch.float16)
+                 cpu_result['local_points'] = interp['local_points'].to(torch.float16)
+                 cpu_result['conf'] = interp['conf'].to(torch.float16)
+                 cpu_result['masks'] = interp['masks']
+                 cpu_result['keypoints'] = kp_res['keypoints'].to(torch.float16).cpu()
+                 if kp_res.get('descriptors') is not None:
+                     cpu_result['descriptors'] = kp_res['descriptors'].to(torch.float16)
+                 if kp_res.get('scores') is not None:
+                     cpu_result['scores'] = kp_res['scores'].to(torch.float16)
+                 cpu_result['colors'] = kp_res['colors'].to(torch.float16)
+             except Exception as e:
+                 print(f"⚠️  Keypoint extraction failed: {e}")
 
         # Add intrinsics if available
         if 'camera_params' in cpu_result and cpu_result['camera_params'] is not None:
-            cpu_result['intrinsics'] = cpu_result['camera_params'].get('intrinsics', None)
+             cpu_result['intrinsics'] = cpu_result['camera_params'].get('intrinsics', None)
 
         # Create and store uint8 grayscale images for LK refinement
         try:
-            imgs = cpu_result.get('images', None)
-            if imgs is not None:
-                # imgs: (N, C, H, W) in [0,1] float
-                import numpy as _np
-                import cv2 as _cv2
-                imgs_np = imgs.numpy()
-                if imgs_np.ndim == 4 and imgs_np.shape[1] == 3:
-                    imgs_np = (imgs_np * 255.0).clip(0, 255).astype(_np.uint8)
-                    imgs_np = _np.transpose(imgs_np, (0, 2, 3, 1))  # NCHW -> NHWC
-                    gray_list = []
-                    for i in range(imgs_np.shape[0]):
-                        gray = _cv2.cvtColor(imgs_np[i], _cv2.COLOR_RGB2GRAY)
-                        gray_list.append(gray)
-                    cpu_result['gray_images'] = torch.from_numpy(_np.stack(gray_list, axis=0))  # (N, H, W), uint8
+             imgs = cpu_result.get('images', None)
+             if imgs is not None:
+                 import numpy as _np
+                 import cv2 as _cv2
+                 imgs_np = imgs.numpy()
+                 if imgs_np.ndim == 4 and imgs_np.shape[1] == 3:
+                     imgs_np = (imgs_np * 255.0).clip(0, 255).astype(_np.uint8)
+                     imgs_np = _np.transpose(imgs_np, (0, 2, 3, 1))  # NCHW -> NHWC
+                     gray_list = []
+                     for i in range(imgs_np.shape[0]):
+                         gray = _cv2.cvtColor(imgs_np[i], _cv2.COLOR_RGB2GRAY)
+                         gray_list.append(gray)
+                     cpu_result['gray_images'] = torch.from_numpy(_np.stack(gray_list, axis=0))  # (N, H, W), uint8
         except Exception as _e:
-            print(f"⚠️  Failed to create gray_images: {_e}")
+             print(f"⚠️  Failed to create gray_images: {_e}")
 
         # Drop raw color images to reduce size
         try:
-            if 'images' in cpu_result:
-                del cpu_result['images']
+             if 'images' in cpu_result:
+                 del cpu_result['images']
         except Exception:
-            pass
+             pass
 
         return cpu_result
 
@@ -300,7 +300,7 @@ class OfflineChunkCreator:
             raise ValueError("image_paths is empty")
 
         # Determine target size once from first image path
-        self.target_size = calculate_target_size(image_paths[0], pixel_limit=255000 // 2)
+        self.target_size = calculate_target_size(image_paths[0], pixel_limit=self.config.pixel_limit)
         print(f"Target size: {self.target_size}")
 
         dataset = ChunkImageDataset(
@@ -330,41 +330,38 @@ class OfflineChunkCreator:
         infer_frames: List[int] = []
         per_chunk_fps: List[float] = []
         for chunk_idx, batch in enumerate(loader):
-            start_idx = int(batch['start_idx'].item())
-            end_idx = int(batch['end_idx'].item())
-            chunk_images: torch.Tensor = batch['chunk']  # (1, N, C, H, W)
-            chunk_paths: List[str] = batch['chunk_paths'][0]
+             start_idx = int(batch['start_idx'].item())
+             end_idx = int(batch['end_idx'].item())
+             chunk_images: torch.Tensor = batch['chunk']  # (1, N, C, H, W)
+             chunk_paths: List[str] = batch['chunk_paths'][0]
 
-            print(f"📦 Chunk {chunk_idx+1}/{len(dataset)}: frames {start_idx+1}-{end_idx}")
-            chunk_result = self._process_single_chunk(chunk_images, chunk_paths)
-            # collect metrics for totals
-            m = chunk_result.get('_metrics', {})
-            if m:
-                infer_times.append(float(m.get('infer_s', 0.0)))
-                infer_frames.append(int(m.get('num_frames', 0)))
-                per_chunk_fps.append(float(m.get('fps', 0.0)))
+             print(f"📦 Chunk {chunk_idx+1}/{len(dataset)}: frames {start_idx+1}-{end_idx}")
+             chunk_result = self._process_single_chunk(chunk_images, chunk_paths)
+             m = chunk_result.get('_metrics', {})
+             if m:
+                 infer_times.append(float(m.get('infer_s', 0.0)))
+                 infer_frames.append(int(m.get('num_frames', 0)))
+                 per_chunk_fps.append(float(m.get('fps', 0.0)))
 
-            # Persist to disk (Torch .pt)
-            out_name = f"chunk_{chunk_idx:06d}.pt"
-            out_path = os.path.join(self.chunks_dir, out_name)
-            # Add small metadata
-            chunk_result['chunk_index'] = chunk_idx
-            chunk_result['start_idx'] = start_idx
-            chunk_result['end_idx'] = end_idx
-            try:
-                torch.save(chunk_result, out_path)
-                saved_files.append(out_path)
-                manifest.append({
-                    'chunk_index': chunk_idx,
-                    'file': out_name,
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'num_frames': len(chunk_paths),
-                    'image_paths': chunk_paths,
-                })
-                print(f"   💾 Saved: {out_path}")
-            except Exception as e:
-                print(f"❌ Failed to save chunk {chunk_idx}: {e}")
+             out_name = f"chunk_{chunk_idx:06d}.pt"
+             out_path = os.path.join(self.chunks_dir, out_name)
+             chunk_result['chunk_index'] = chunk_idx
+             chunk_result['start_idx'] = start_idx
+             chunk_result['end_idx'] = end_idx
+             try:
+                 torch.save(chunk_result, out_path)
+                 saved_files.append(out_path)
+                 manifest.append({
+                     'chunk_index': chunk_idx,
+                     'file': out_name,
+                     'start_idx': start_idx,
+                     'end_idx': end_idx,
+                     'num_frames': len(chunk_paths),
+                     'image_paths': chunk_paths,
+                 })
+                 print(f"   💾 Saved: {out_path}")
+             except Exception as e:
+                 print(f"❌ Failed to save chunk {chunk_idx}: {e}")
 
         # Summaries
         try:

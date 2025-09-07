@@ -18,6 +18,7 @@ import time
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pi3.utils.basic import write_ply
+from dataclasses import dataclass
 
 from utils.chunk_reconstruction import ChunkPTRecon
 from utils.reconstruction_alignment import create_view_graph_matches, align_and_refine_reconstructions
@@ -116,22 +117,27 @@ def _reconstruct_chunk_worker(args: Tuple[int, str, str, int, bool, bool, bool, 
         }
 
 
+@dataclass
+class OfflineReconstructorConfig:
+    chunk_dir: str
+    output_dir: str
+    chunk_length: Optional[int] = None
+    overlap: Optional[int] = None
+    max_observations_per_track: int = 5
+    save_per_chunk: bool = False
+    use_inverse_depth: bool = False
+    num_workers: Optional[int] = None
+    use_lk_refinement: bool = False
+    debug_lk_refinement: bool = False
+    shared_intrinsics: bool = True
+
 class OfflineReconstructor:
-    def __init__(self, 
-                chunk_dir: str, 
-                output_dir: str, 
-                chunk_length: Optional[int] = None, 
-                 overlap: Optional[int] = None, 
-                 max_observations_per_track: int = 5, 
-                 save_per_chunk: bool = False,
-                 use_inverse_depth: bool = False, 
-                 num_workers: Optional[int] = None, 
-                 use_lk_refinement: bool = False, 
-                 debug_lk_refinement: bool = False):
-        self.chunk_dir = chunk_dir
-        self.output_dir = output_dir
-        self.use_lk_refinement = use_lk_refinement
-        self.debug_lk_refinement = debug_lk_refinement
+    def __init__(self, config: OfflineReconstructorConfig):
+        self.chunk_dir = config.chunk_dir
+        self.output_dir = config.output_dir
+        self.use_lk_refinement = config.use_lk_refinement
+        self.debug_lk_refinement = config.debug_lk_refinement
+        self.shared_intrinsics = config.shared_intrinsics
 
         # Auto-load metadata if not provided
         meta_path = os.path.join(self.chunk_dir, 'chunk_metadata.json')
@@ -148,12 +154,12 @@ class OfflineReconstructor:
         except Exception:
             pass
 
-        self.chunk_length = int(chunk_length) if chunk_length is not None else (loaded_chunk_length or 100)
-        self.overlap = int(overlap) if overlap is not None else (loaded_overlap or 10)
-        self.max_observations_per_track = max_observations_per_track
-        self.save_per_chunk = save_per_chunk
-        self.use_inverse_depth = use_inverse_depth
-        self.num_workers = int(num_workers) if num_workers is not None else max(1, (os.cpu_count() or 1))
+        self.chunk_length = int(config.chunk_length) if config.chunk_length is not None else (loaded_chunk_length or 100)
+        self.overlap = int(config.overlap) if config.overlap is not None else (loaded_overlap or 10)
+        self.max_observations_per_track = config.max_observations_per_track
+        self.save_per_chunk = config.save_per_chunk
+        self.use_inverse_depth = config.use_inverse_depth
+        self.num_workers = int(config.num_workers) if config.num_workers is not None else max(1, (os.cpu_count() or 1))
 
         os.makedirs(self.output_dir, exist_ok=True)
         self.recon_dir = os.path.join(self.output_dir, 'reconstructions')
@@ -183,7 +189,8 @@ class OfflineReconstructor:
             max_observations_per_track=self.max_observations_per_track,
             use_inverse_depth=self.use_inverse_depth,
             use_lk_refinement=self.use_lk_refinement,
-            collect_debug=self.debug_lk_refinement)
+            collect_debug=self.debug_lk_refinement,
+            shared_intrinsics=self.shared_intrinsics)
         
         
         return recon
@@ -341,6 +348,25 @@ class OfflineReconstructor:
             except Exception as e:
                 print(f"❌ Failed to save TUM trajectory: {e}")
 
+            # Optional: interpolate missing frames based on frame_selection.json
+            try:
+                selection_path = os.path.join(os.path.dirname(self.chunk_dir), 'frame_selection.json')
+                if not os.path.exists(selection_path):
+                    selection_path = os.path.join(self.chunk_dir, 'frame_selection.json')
+                if os.path.exists(selection_path):
+                    import json
+                    with open(selection_path, 'r') as f:
+                        sel = json.load(f)
+                    total_frames = int(sel.get('original_total_frames', 0))
+                    selected_indices = sel.get('selected_indices', [])
+                    if total_frames > 0 and selected_indices:
+                        print(f"\n🔧 Interpolating missing frames (total={total_frames}, selected={len(selected_indices)})...")
+                        self._interpolate_and_save_full_trajectory(total_frames, selected_indices)
+                else:
+                    print("ℹ️  No frame_selection.json found; skipping pose interpolation")
+            except Exception as e:
+                print(f"⚠️  Pose interpolation failed: {e}")
+
     def _extract_points_colors_from_reconstructions(self, latest_only: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         if not self.reconstructions:
             return np.array([]), np.array([])
@@ -427,5 +453,101 @@ class OfflineReconstructor:
             print("❌ Error: scipy.spatial.transform.Rotation not available")
         except Exception as e:
             print(f"❌ Error saving trajectory: {e}")
+
+    def _interpolate_and_save_full_trajectory(self, total_frames: int, selected_indices: List[int]) -> None:
+        try:
+            from scipy.spatial.transform import Rotation, Slerp
+        except ImportError:
+            print("❌ scipy not available; cannot perform SLERP interpolation")
+            return
+
+        # Extract known camera poses in order of appearance
+        positions, orientations, _ = self._extract_camera_positions_from_reconstructions()
+        if not positions or not orientations:
+            print("⚠️  No poses available for interpolation")
+            return
+
+        # Map selected_indices -> pose index order
+        if len(selected_indices) != len(positions):
+            print(f"⚠️  Mismatch: selected {len(selected_indices)} vs reconstructed {len(positions)}; proceeding with min length")
+        k = min(len(selected_indices), len(positions))
+        selected_indices = selected_indices[:k]
+        positions = positions[:k]
+        orientations = orientations[:k]
+
+        key_times = np.array(selected_indices, dtype=float)
+        key_rots = Rotation.from_matrix(np.stack(orientations, axis=0))
+        slerp = Slerp(key_times, key_rots)
+
+        # Interpolate per-frame
+        all_times = np.arange(total_frames, dtype=float)
+        interp_rots = slerp(all_times)
+
+        # Linear translation interpolation per axis
+        positions_np = np.stack(positions, axis=0)
+        interp_pos = np.empty((total_frames, 3), dtype=np.float32)
+        for dim in range(3):
+            interp_pos[:, dim] = np.interp(all_times, key_times, positions_np[:, dim])
+
+        # Save TUM full
+        tum_full = os.path.join(self.output_dir, 'trajectory_tum_full.txt')
+        try:
+            with open(tum_full, 'w') as f:
+                f.write("# timestamp tx ty tz qx qy qz qw\n")
+                quats = interp_rots.as_quat()  # x,y,z,w
+                for i in range(total_frames):
+                    x, y, z = interp_pos[i]
+                    qx, qy, qz, qw = quats[i]
+                    f.write(f"{i} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
+            print(f"✅ Saved interpolated full TUM trajectory: {tum_full}")
+        except Exception as e:
+            print(f"❌ Failed to save interpolated TUM: {e}")
+
+        # Save camera positions PLY full
+        try:
+            cam_cols = np.full((total_frames, 3), [0.0, 1.0, 0.0], dtype=np.float32)
+            cam_ply_full = os.path.join(self.output_dir, 'final_camera_poses_full.ply')
+            write_ply(torch.from_numpy(interp_pos), torch.from_numpy(cam_cols), cam_ply_full)
+            print(f"✅ Saved interpolated camera PLY: {cam_ply_full}")
+        except Exception as e:
+            print(f"❌ Failed to save interpolated camera PLY: {e}")
+
+        # Optionally add dummy unestimated views to reconstruction to reflect full timeline
+        try:
+            current_views = set(self.reconstruction.ViewIds())
+            # Build map from existing timestamps (names are filenames or frame indices as timestamp)
+            existing_names = {}
+            for vid in current_views:
+                view = self.reconstruction.View(vid)
+                try:
+                    name = view.Name()
+                    existing_names[name] = vid
+                except Exception:
+                    pass
+            # Append missing views with intrinsics prior only
+            intrinsics_example = None
+            for vid in current_views:
+                cam = self.reconstruction.View(vid).Camera()
+                try:
+                    intrinsics_example = cam.GetCalibrationMatrix()
+                    break
+                except Exception:
+                    continue
+            for i in range(total_frames):
+                name = f"frame_{i}"
+                if name in existing_names:
+                    continue
+                view_id = self.reconstruction.AddView(name, 0, i)
+                view = self.reconstruction.MutableView(view_id)
+                # Set pose estimate
+                R = interp_rots[i].as_matrix().T  # our orientation storage expects transpose
+                t = interp_pos[i]
+                cam = view.MutableCamera()
+                cam.SetPosition(t)
+                cam.SetOrientationFromRotationMatrix(R)
+                # mark as unestimated to avoid polluting BA
+                view.SetIsEstimated(True)
+        except Exception as e:
+            print(f"⚠️  Failed to append interpolated views to reconstruction: {e}")
 
 

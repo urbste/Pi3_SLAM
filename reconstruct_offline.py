@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 
-from slam.offline_reconstructor import OfflineReconstructor
+from slam.offline_reconstructor import OfflineReconstructor, OfflineReconstructorConfig
 
 
 def main():
@@ -24,14 +24,15 @@ def main():
     parser.add_argument("--overlap", type=int, default=None)
     parser.add_argument("--max-observations-per-track", type=int, default=5)
     parser.add_argument("--save-per-chunk", default=True, help="Save per-chunk .sfm/.ply files as well")
-    parser.add_argument("--use-inverse-depth", default=True, help="Use inverse depth parametrization")
+    parser.add_argument("--use-inverse-depth", action="store_true", help="Use inverse depth parametrization")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of worker processes. Set to 0 to run sequentially.")
-    parser.add_argument("--use-lk-refinement", default=True, help="Use Lucas-Kanade refinement")
+    parser.add_argument("--use-lk-refinement", action="store_true", help="Use Lucas-Kanade refinement")
     parser.add_argument("--debug-lk-refinement", action="store_true", help="Debug Lucas-Kanade refinement")
+    parser.add_argument("--shared-intrinsics", action="store_true", help="Use same shared intrinsics for all chunks. we will set the first frame's intrinsics as the shared intrinsics")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
-    recon = OfflineReconstructor(
+    cfg = OfflineReconstructorConfig(
         chunk_dir=args.chunks,
         output_dir=args.output,
         chunk_length=args.chunk_length,
@@ -42,7 +43,9 @@ def main():
         num_workers=args.num_workers,
         use_lk_refinement=args.use_lk_refinement,
         debug_lk_refinement=args.debug_lk_refinement,
+        shared_intrinsics=args.shared_intrinsics,
     )
+    recon = OfflineReconstructor(cfg)
     recon.run()
 
 
