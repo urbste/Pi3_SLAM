@@ -19,3 +19,6 @@ output/
 *.sfm
 
 ba_results/
+
+runs/
+checkpoints/

@@ -9,7 +9,7 @@ import numpy as np
 import natsort
 import psutil
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import open3d as o3d
 
 # Import undistortion utilities
@@ -173,6 +173,75 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000,
         return torch.empty(0)
 
     # --- 4. Stack the list of tensors into a single [N, C, H, W] batch tensor ---
+    return torch.stack(tensor_list, dim=0)
+
+
+def load_images_from_paths(
+    image_paths: List[str],
+    PIXEL_LIMIT: int = 255000
+) -> torch.Tensor:
+    """
+    Load a list of image file paths into a single tensor [N, 3, H, W].
+
+    - Supports PNG/JPG/JPEG and any Pillow-readable format
+    - Converts grayscale images to RGB
+    - Resizes all images to a uniform size (multiple of 14) based on the first image,
+      keeping total pixels under PIXEL_LIMIT
+
+    Args:
+        image_paths: List of absolute or relative file paths to images
+        PIXEL_LIMIT: Maximum number of pixels per image
+
+    Returns:
+        torch.Tensor of shape [N, 3, H, W]
+    """
+    if image_paths is None or len(image_paths) == 0:
+        return torch.empty(0)
+
+    sources: List[Image.Image] = []
+
+    for img_path in image_paths:
+        try:
+            img = Image.open(img_path)
+            # Convert grayscale or other modes to RGB
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            sources.append(img)
+        except Exception as e:
+            print(f"Could not load image {img_path}: {e}")
+
+    if not sources:
+        print("No valid images found in provided paths.")
+        return torch.empty(0)
+
+    # Determine uniform target size from the first image
+    first_img = sources[0]
+    W_orig, H_orig = first_img.size
+    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
+    W_target, H_target = W_orig * scale, H_orig * scale
+    k, m = round(W_target / 14), round(H_target / 14)
+    while (k * 14) * (m * 14) > PIXEL_LIMIT:
+        if k / m > W_target / H_target:
+            k -= 1
+        else:
+            m -= 1
+    TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
+
+    tensor_list: List[torch.Tensor] = []
+    to_tensor_transform = transforms.ToTensor()
+
+    for img_pil in sources:
+        try:
+            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            img_tensor = to_tensor_transform(resized_img)
+            tensor_list.append(img_tensor)
+        except Exception as e:
+            print(f"Error processing an image: {e}")
+
+    if not tensor_list:
+        print("No images were successfully processed from provided paths.")
+        return torch.empty(0)
+
     return torch.stack(tensor_list, dim=0)
 
 

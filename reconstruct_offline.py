@@ -18,8 +18,8 @@ from slam.offline_reconstructor import OfflineReconstructor, OfflineReconstructo
 
 def main():
     parser = argparse.ArgumentParser(description="Reconstruct from saved PI3 chunks")
-    parser.add_argument("--chunks", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/chunks", help="Directory containing chunk_*.pt files")
-    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/reconstruction", help="Directory to write reconstructions (sfm/ply)")
+    parser.add_argument("--chunks", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/chunks", help="Directory containing chunk_*.pt files")
+    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/reconstruction", help="Directory to write reconstructions (sfm/ply)")
     parser.add_argument("--chunk-length", type=int, default=None)
     parser.add_argument("--overlap", type=int, default=None)
     parser.add_argument("--max-observations-per-track", type=int, default=5)

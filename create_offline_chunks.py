@@ -43,9 +43,9 @@ def list_images(root: str) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Create offline PI3 chunks and save to disk")
-    parser.add_argument("--images", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/", help="Folder with images, a glob pattern, or a text file listing image paths")
+    parser.add_argument("--images", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/", help="Folder with images, a glob pattern, or a text file listing image paths")
     parser.add_argument("--model-path", default="/home/steffen/ModelWeights/pi3/model.safetensors", help="Pi3 model identifier or local path for Pi3.from_pretrained")
-    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced/chunks", help="Output directory")
+    parser.add_argument("--output", default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_small/chunks", help="Output directory")
     parser.add_argument("--chunk-length", type=int, default=40)
     parser.add_argument("--overlap", type=int, default=5)
     parser.add_argument("--device", default="cuda")
@@ -60,12 +60,12 @@ def main():
     parser.add_argument("--attention-merge", action="store_true")
     parser.add_argument("--merging-ratio", type=float, default=0.6)
     parser.add_argument("--compile-models", action="store_true", help="Compile models")
-    parser.add_argument("--pixel-limit", type=int, default=255000, help="Pixel limit for video processing")
+    parser.add_argument("--pixel-limit", type=int, default=170000, help="Pixel limit for video processing")
 
     # Optional frame range controls (consistent with online CLI)
     parser.add_argument("--skip-start", type=int, default=0, help="Number of frames to skip from the beginning")
     parser.add_argument("--skip-end", type=int, default=0, help="Number of frames to skip from the end")
-    parser.add_argument("--frame-stride", type=int, default=1, help="Process every k-th frame (>=1)")
+    parser.add_argument("--frame-stride", type=int, default=2, help="Process every k-th frame (>=1)")
     args = parser.parse_args()
 
     all_image_paths = list_images(args.images)

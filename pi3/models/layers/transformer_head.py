@@ -1,6 +1,6 @@
 from .attention import FlashAttentionRope, AttentionRopeFP8
 from .block import BlockRope
-from ..dinov2.layers import Mlp
+from ..dinov2.layers import Mlp, MlpFP8
 import torch.nn as nn
 from functools import partial
 from torch.utils.checkpoint import checkpoint
@@ -19,6 +19,7 @@ class TransformerDecoder(nn.Module):
         need_project=True,
         use_checkpoint=False,
         use_fp8_attention: bool = False,
+        use_fp8_ffn: bool | None = None,
     ):
         super().__init__()
 
@@ -26,6 +27,8 @@ class TransformerDecoder(nn.Module):
         self.use_checkpoint = use_checkpoint
 
         attn_impl = AttentionRopeFP8 if use_fp8_attention else FlashAttentionRope
+        use_ffn_fp8 = use_fp8_attention if use_fp8_ffn is None else use_fp8_ffn
+        ffn_impl = MlpFP8 if use_ffn_fp8 else Mlp
         self.blocks = nn.ModuleList([
             BlockRope(
                 dim=dec_embed_dim,
@@ -37,7 +40,7 @@ class TransformerDecoder(nn.Module):
                 drop_path=0.0,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 act_layer=nn.GELU,
-                ffn_layer=Mlp,
+                ffn_layer=ffn_impl,
                 init_values=None,
                 qk_norm=False,
                 # attn_class=MemEffAttentionRope,

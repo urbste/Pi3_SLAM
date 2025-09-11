@@ -130,6 +130,9 @@ class OfflineReconstructorConfig:
     use_lk_refinement: bool = False
     debug_lk_refinement: bool = False
     shared_intrinsics: bool = True
+    # Filtering options for final point cloud
+    point_distance_percentile: float = 99.5  # keep points within this distance percentile
+    max_point_distance: Optional[float] = None  # absolute cap in scene units (overrides percentile if set)
 
 class OfflineReconstructor:
     def __init__(self, config: OfflineReconstructorConfig):
@@ -160,6 +163,10 @@ class OfflineReconstructor:
         self.save_per_chunk = config.save_per_chunk
         self.use_inverse_depth = config.use_inverse_depth
         self.num_workers = int(config.num_workers) if config.num_workers is not None else max(1, (os.cpu_count() or 1))
+
+        # Outlier filtering configuration
+        self.point_distance_percentile = float(getattr(config, 'point_distance_percentile', 99.5))
+        self.max_point_distance = getattr(config, 'max_point_distance', None)
 
         os.makedirs(self.output_dir, exist_ok=True)
         self.recon_dir = os.path.join(self.output_dir, 'reconstructions')
@@ -319,6 +326,8 @@ class OfflineReconstructor:
             try:
                 points, colors = self._extract_points_colors_from_reconstructions(latest_only=False)
                 if points.size > 0:
+                    # Filter extreme outliers in distance
+                    points, colors = self._filter_points_by_distance(points, colors)
                     ply_path = os.path.join(self.output_dir, 'final_points.ply')
                     write_ply(torch.from_numpy(points), torch.from_numpy(colors if colors.size > 0 else np.ones_like(points)), ply_path)
                     print(f"\n✅ Final point cloud saved: {ply_path}")
@@ -415,6 +424,46 @@ class OfflineReconstructor:
                 names.append(name)
         return positions, orientations, names
 
+    def _compute_distance_center(self) -> Optional[np.ndarray]:
+        positions, _, _ = self._extract_camera_positions_from_reconstructions()
+        if positions:
+            # Robust center: median of camera positions
+            return np.median(np.stack(positions, axis=0), axis=0)
+        return None
+
+    def _filter_points_by_distance(self, points: np.ndarray, colors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if points.size == 0:
+            return points, colors
+        center = self._compute_distance_center()
+        if center is None:
+            # Fallback to robust center of points themselves
+            center = np.median(points, axis=0)
+        dists = np.linalg.norm(points - center[None, :], axis=1)
+
+        if self.max_point_distance is not None and np.isfinite(self.max_point_distance) and self.max_point_distance > 0:
+            thresh = float(self.max_point_distance)
+        else:
+            # Percentile-based robust threshold
+            p = float(self.point_distance_percentile)
+            p = min(max(p, 0.0), 100.0)
+            thresh = float(np.percentile(dists, p))
+
+            # Guard against degenerate threshold (e.g., all points at same distance)
+            if not np.isfinite(thresh) or thresh <= 0:
+                return points, colors
+
+        mask = dists <= thresh
+        num_kept = int(mask.sum())
+        num_total = int(points.shape[0])
+        if num_kept < num_total:
+            print(f"   ✂️  Filtered {num_total - num_kept} / {num_total} points beyond {thresh:.3f} units from center")
+        points_f = points[mask]
+        if colors is not None and colors.size > 0 and len(colors) == num_total:
+            colors_f = colors[mask]
+        else:
+            colors_f = colors
+        return points_f, colors_f
+
     def _build_full_camera_trajectory(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         positions, orientations, names = self._extract_camera_positions_from_reconstructions()
         seen = set()
@@ -461,11 +510,13 @@ class OfflineReconstructor:
             print("❌ scipy not available; cannot perform SLERP interpolation")
             return
 
-        # Extract known camera poses in order of appearance
-        positions, orientations, _ = self._extract_camera_positions_from_reconstructions()
-        if not positions or not orientations:
+        # Extract known camera poses (deduplicated by view name, in order)
+        traj, rots = self._build_full_camera_trajectory()
+        if not traj or not rots:
             print("⚠️  No poses available for interpolation")
             return
+        positions = traj
+        orientations = rots
 
         # Map selected_indices -> pose index order
         if len(selected_indices) != len(positions):
@@ -479,9 +530,22 @@ class OfflineReconstructor:
         key_rots = Rotation.from_matrix(np.stack(orientations, axis=0))
         slerp = Slerp(key_times, key_rots)
 
-        # Interpolate per-frame
+        # Interpolate per-frame, clamping outside the key range to end rotations
         all_times = np.arange(total_frames, dtype=float)
-        interp_rots = slerp(all_times)
+        in_range_mask = (all_times >= key_times[0]) & (all_times <= key_times[-1])
+        interp_quats = np.empty((total_frames, 4), dtype=np.float64)
+        # Fill interior via SLERP
+        if np.any(in_range_mask):
+            interp_rots_in = slerp(all_times[in_range_mask])
+            interp_quats[in_range_mask] = interp_rots_in.as_quat()
+        # Fill leading with first rotation
+        first_quat = key_rots.as_quat()[0]
+        if np.any(~in_range_mask & (all_times < key_times[0])):
+            interp_quats[all_times < key_times[0]] = first_quat
+        # Fill trailing with last rotation
+        last_quat = key_rots.as_quat()[-1]
+        if np.any(~in_range_mask & (all_times > key_times[-1])):
+            interp_quats[all_times > key_times[-1]] = last_quat
 
         # Linear translation interpolation per axis
         positions_np = np.stack(positions, axis=0)
@@ -494,10 +558,9 @@ class OfflineReconstructor:
         try:
             with open(tum_full, 'w') as f:
                 f.write("# timestamp tx ty tz qx qy qz qw\n")
-                quats = interp_rots.as_quat()  # x,y,z,w
                 for i in range(total_frames):
                     x, y, z = interp_pos[i]
-                    qx, qy, qz, qw = quats[i]
+                    qx, qy, qz, qw = interp_quats[i]
                     f.write(f"{i} {x:.6f} {y:.6f} {z:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
             print(f"✅ Saved interpolated full TUM trajectory: {tum_full}")
         except Exception as e:
@@ -512,42 +575,37 @@ class OfflineReconstructor:
         except Exception as e:
             print(f"❌ Failed to save interpolated camera PLY: {e}")
 
-        # Optionally add dummy unestimated views to reconstruction to reflect full timeline
-        try:
-            current_views = set(self.reconstruction.ViewIds())
-            # Build map from existing timestamps (names are filenames or frame indices as timestamp)
-            existing_names = {}
-            for vid in current_views:
-                view = self.reconstruction.View(vid)
-                try:
-                    name = view.Name()
-                    existing_names[name] = vid
-                except Exception:
-                    pass
-            # Append missing views with intrinsics prior only
-            intrinsics_example = None
-            for vid in current_views:
-                cam = self.reconstruction.View(vid).Camera()
-                try:
-                    intrinsics_example = cam.GetCalibrationMatrix()
-                    break
-                except Exception:
-                    continue
-            for i in range(total_frames):
-                name = f"frame_{i}"
-                if name in existing_names:
-                    continue
-                view_id = self.reconstruction.AddView(name, 0, i)
-                view = self.reconstruction.MutableView(view_id)
-                # Set pose estimate
-                R = interp_rots[i].as_matrix().T  # our orientation storage expects transpose
-                t = interp_pos[i]
-                cam = view.MutableCamera()
-                cam.SetPosition(t)
-                cam.SetOrientationFromRotationMatrix(R)
-                # mark as unestimated to avoid polluting BA
-                view.SetIsEstimated(True)
-        except Exception as e:
-            print(f"⚠️  Failed to append interpolated views to reconstruction: {e}")
+        
+        # # Optionally append interpolated views to the final reconstruction
+        # try:
+        #     if self.reconstructions:
+        #         last_recon = self.reconstructions[-1]
+        #         current_views = set(last_recon.ViewIds())
+        #         # Build map from existing view names
+        #         existing_names = {}
+        #         for vid in current_views:
+        #             view = last_recon.View(vid)
+        #             try:
+        #                 name = view.Name()
+        #                 existing_names[name] = vid
+        #             except Exception:
+        #                 pass
+        #         # Append any missing frames as estimated views with poses from interpolation
+        #         for i in range(total_frames):
+        #             name = f"frame_{i}"
+        #             if name in existing_names:
+        #                 continue
+        #             view_id = last_recon.AddView(name, 0, i)
+        #             view = last_recon.MutableView(view_id)
+        #             R = interp_rots[i].as_matrix().T
+        #             t = interp_pos[i]
+        #             cam = view.MutableCamera()
+        #             cam.SetPosition(t)
+        #             cam.SetOrientationFromRotationMatrix(R)
+        #             view.SetIsEstimated(True)
+        #     else:
+        #         print("ℹ️  No base reconstruction to append interpolated views to; skipping")
+        # except Exception as e:
+        #     print(f"⚠️  Failed to append interpolated views to reconstruction: {e}")
 
 

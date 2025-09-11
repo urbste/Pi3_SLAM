@@ -10,7 +10,7 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope, AttentionRopeFP8
 from .layers.transformer_head import TransformerDecoder, LinearPts3d
 from .layers.camera_head import CameraHead
-from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
+from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg, dinov2_vits14_reg, dinov2_vitb14_reg
 from huggingface_hub import PyTorchModelHubMixin
 
 class Pi3(nn.Module, PyTorchModelHubMixin):
@@ -18,10 +18,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             self,
             pos_type='rope100',
             decoder_size='large',
-            global_merging: bool = True,
+            global_merging: bool = False,
             merging: int = 0,
             merge_ratio: float = 0.9,
-            use_fp8_attention: bool = True,
+            use_fp8_attention: bool = False,
         ):
         super().__init__()
 
@@ -35,8 +35,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         # ----------------------
         #        Encoder
         # ----------------------
-        self.encoder = dinov2_vitl14_reg(pretrained=False)
-        self.patch_size = 14
+        if decoder_size == 'small':
+            self.encoder = dinov2_vits14_reg(pretrained=True)
+            self.patch_size = 14
+        elif decoder_size in ['base']:
+            self.encoder = dinov2_vitb14_reg(pretrained=False)
+            self.patch_size = 14
+        elif decoder_size in ['large']:
+            self.encoder = dinov2_vitl14_reg(pretrained=False)
+            self.patch_size = 14
         del self.encoder.mask_token
 
         # ----------------------
@@ -95,6 +102,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
 
+        self.project_stud_to_teach = nn.Linear(2*384, 2*1024)
+
         # ----------------------
         #     Register_token
         # ----------------------
@@ -107,7 +116,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         #  Local Points Decoder
         # ----------------------
         self.point_decoder = TransformerDecoder(
-            in_dim=2*self.dec_embed_dim, 
+            in_dim=2*1024, 
             dec_embed_dim=1024,
             dec_num_heads=16,
             out_dim=1024,
@@ -126,7 +135,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         #  Camera Pose Decoder
         # ----------------------
         self.camera_decoder = TransformerDecoder(
-            in_dim=2*self.dec_embed_dim, 
+            in_dim=2*1024, 
             dec_embed_dim=1024,
             dec_num_heads=16,                # 8
             out_dim=512,
@@ -139,6 +148,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         # For ImageNet Normalize
         image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         image_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+        self.is_distillation = False
 
         self.register_buffer("image_mean", image_mean)
         self.register_buffer("image_std", image_std)
@@ -287,11 +298,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         if isinstance(hidden, dict):
             hidden = hidden["x_norm_patchtokens"]
-
+        
         self.decoder = self.decoder.cuda()
 
         hidden, pos = self.decode(hidden, N, H, W)
         hidden = hidden.to(pos.device)
+
+        if self.is_distillation:
+            hidden = self.project_stud_to_teach(hidden)
+
         # free memory
         self.decoder = self.decoder.cpu()
 
@@ -300,10 +315,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         # local points
         point_hidden = self.point_decoder(hidden, xpos=pos)
-        point_hidden = point_hidden
         ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-        del point_hidden
-        torch.cuda.empty_cache()
+        if not self.is_distillation:
+            del point_hidden
+            torch.cuda.empty_cache()
 
         xy, z = ret.split([2, 1], dim=-1)
         z = torch.exp(z)
@@ -312,22 +327,25 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         # confidence
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
         conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-        del conf_hidden
-        torch.cuda.empty_cache()
+        if not self.is_distillation:
+            del conf_hidden
+            torch.cuda.empty_cache()
 
         # camera
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
         camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
-        del camera_hidden
-        torch.cuda.empty_cache()
+        if not self.is_distillation:
+            del camera_hidden
+            torch.cuda.empty_cache()
 
         # unproject local points using camera poses
-        points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+        #points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
 
             
         return dict(
-            points=points.float(),
+            #points=points.float(),
             local_points=local_points.float(),
             conf=conf.float(),
             camera_poses=camera_poses.float(),
+            hidden=hidden.float()
         )

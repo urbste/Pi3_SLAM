@@ -152,33 +152,17 @@ class ChunkPTRecon:
         # Add tracks and observations only if keypoints are available
         if has_keypoints:
             for frame_idx in range(num_frames):
-                t_frame0 = time.time()
+
                 # Get 3D points and colors for this frame
                 points_3d = chunk_data['points'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 colors = chunk_data['colors'][frame_idx].cpu().numpy()  # (num_keypoints, 3)
                 keypoints_2d = chunk_data['keypoints'][frame_idx].cpu().numpy()  # (num_keypoints, 2)
                 
                 # Create tracks for this frame
-                t_tracks0 = time.time()
-                frame_track_ids = []
-                for kp_idx in range(keypoints_2d.shape[0]):
-                    track_id = self.reconstruction.AddTrack()
-                    track = self.reconstruction.MutableTrack(track_id)
-                    track.SetPoint(np.hstack([points_3d[kp_idx], 1]))
-                    track.SetColor(colors[kp_idx])
-                    track.SetIsEstimated(True)
-                    frame_track_ids.append(track_id)
-                t_tracks1 = time.time()
-                
+                frame_track_ids = pt.sfm.AddTracks(points_3d, colors, self.reconstruction)
+ 
                 # Add observation for this frame
-                t_obs_self0 = time.time()
-                for kp_idx in range(keypoints_2d.shape[0]):
-                    self.reconstruction.AddObservation(
-                        self.view_ids[frame_idx], 
-                        frame_track_ids[kp_idx], 
-                        pt.sfm.Feature(keypoints_2d[kp_idx])
-                    )
-                t_obs_self1 = time.time()
+                pt.sfm.AddObservations(self.view_ids[frame_idx], frame_track_ids, keypoints_2d, self.reconstruction)
                 
                 # Project keypoints to subset of other frames
                 all_frames = [i for i in range(num_frames)]
@@ -188,15 +172,11 @@ class ChunkPTRecon:
                 all_frames = all_frames_before + all_frames_after
 
                 # Project points to all other frames
-                t_proj0 = time.time()
                 projected_points = self._project_points_to_other_cams(
                     chunk_data, frame_idx, all_frames
                 )
-                t_proj1 = time.time()
                 
                 added_obs = 0
-                t_lk_total = 0.0
-                t_obs_total = 0.0
                 if use_lk_refinement:
                     # Prepare Lucas–Kanade refinement inputs (grayscale uint8 images)
                     try:
@@ -218,14 +198,12 @@ class ChunkPTRecon:
                         final_points = projected_kps.copy()
 
                         if source_gray is not None and other_frame_idx in target_grays and target_grays[other_frame_idx] is not None:
-                            t_lk0 = time.time()
                             prev_pts = chunk_data['keypoints'][frame_idx].cpu().numpy().astype(np.float32).reshape(-1, 1, 2)
                             next_pts, status, _err = cv2.calcOpticalFlowPyrLK(
                                 source_gray, target_grays[other_frame_idx], prev_pts, None,
                                 winSize=lk_win, maxLevel=lk_levels, criteria=lk_criteria
                             )
-                            t_lk1 = time.time()
-                            t_lk_total += (t_lk1 - t_lk0)
+
                             if next_pts is not None and status is not None:
                                 next_pts = next_pts.reshape(-1, 2)
                                 status = status.reshape(-1)
@@ -248,7 +226,6 @@ class ChunkPTRecon:
                                 pass
 
                         # Add observations for final points
-                        t_obs0 = time.time()
                         for kp_idx, (track_id, final_pt) in enumerate(zip(frame_track_ids, final_points)):
                             if (0 <= final_pt[0] < self.original_width and 
                                 0 <= final_pt[1] < self.original_height):
@@ -258,8 +235,6 @@ class ChunkPTRecon:
                                     pt.sfm.Feature(final_pt)
                                 )
                                 added_obs += 1
-                        t_obs1 = time.time()
-                        t_obs_total += (t_obs1 - t_obs0)
                 else:
                     # LK disabled: add observations from projected points only
                     for other_frame_idx, projected_kps in zip(all_frames, projected_points):
@@ -272,7 +247,7 @@ class ChunkPTRecon:
                                 }
                             except Exception:
                                 pass
-                        t_obs0 = time.time()
+
                         for kp_idx, (track_id, projected_pt) in enumerate(zip(frame_track_ids, projected_kps)):
                             if (0 <= projected_pt[0] < self.original_width and 
                                 0 <= projected_pt[1] < self.original_height):
@@ -282,11 +257,9 @@ class ChunkPTRecon:
                                     pt.sfm.Feature(projected_pt)
                                 )
                                 added_obs += 1
-                        t_obs1 = time.time()
-                        t_obs_total += (t_obs1 - t_obs0)
 
-                t_frame1 = time.time()
-                print(f"   Frame {frame_idx}: tracks {keypoints_2d.shape[0]} in {(t_tracks1 - t_tracks0):.3f}s, proj {(t_proj1 - t_proj0):.3f}s, LK {t_lk_total:.3f}s, obs {added_obs} in {t_obs_total:.3f}s, total {(t_frame1 - t_frame0):.3f}s")
+                t_frame1 = time.perf_counter()
+                #print(f"   Frame {frame_idx}: tracks {keypoints_2d.shape[0]} in {(t_tracks1 - t_tracks0):.3f}s, obs {keypoints_2d.shape[0]} in {(t_obs_self1 - t_obs_self0):.3f}s, proj {(t_proj1 - t_proj0):.3f}s, LK {t_lk_total:.3f}s, obs {added_obs} in {t_obs_total:.3f}s, total {(t_frame1 - t_frame0):.3f}s")
 
         if self.use_inverse_depth:
             self.reconstruction.InitializeInverseDepth()
@@ -485,25 +458,23 @@ class ChunkPTRecon:
         """
         # Get source camera pose and intrinsics
         source_pose = chunk_data['camera_poses'][source_frame].cpu().numpy()
-        source_intrinsics = chunk_data['intrinsics'][source_frame].cpu().numpy() if 'intrinsics' in chunk_data else None
         
         # Get source keypoints
-        source_keypoints = chunk_data['keypoints'][source_frame]  # (num_keypoints, 2)
         source_points_3d = chunk_data['points'][source_frame]  # (num_keypoints, 3)
         
         projected_points_list = []
         
         for target_frame in target_frames:
             # Get target camera pose and intrinsics
-            target_pose = chunk_data['camera_poses'][target_frame].cpu().numpy()
-            target_intrinsics = chunk_data['intrinsics'][target_frame].cpu().numpy() if 'intrinsics' in chunk_data else None
+            target_pose = chunk_data['camera_poses'][target_frame] 
+            target_intrinsics = chunk_data['intrinsics'][target_frame] if 'intrinsics' in chunk_data else None
             
             # Project 3D points to target camera
             projected_points = self._project_3d_points_to_camera(
                 source_points_3d, source_pose, target_pose, target_intrinsics
             )
             
-            projected_points_list.append(projected_points[:, :2])
+            projected_points_list.append(projected_points[:, :2].cpu().numpy())
         
         return projected_points_list
     
@@ -523,7 +494,7 @@ class ChunkPTRecon:
         """
         # Transform points from world to target camera coordinates
         world_to_target = np.linalg.inv(target_pose)
-        points_in_target = (world_to_target @ np.hstack([points_3d.cpu().numpy(), np.ones((points_3d.shape[0], 1))]).T).T
+        points_in_target = (world_to_target @ np.hstack([points_3d, np.ones((points_3d.shape[0], 1))]).T).T
         
         # Project to 2D
         points_2d = points_in_target[:, :3] / points_in_target[:, 2:3]

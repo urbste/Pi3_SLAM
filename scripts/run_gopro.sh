@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # Configuration defaults
-images_path="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist_reduced"   # Directory containing images
-overall_output_path="logs/gopro/run_small_chunks_170000"
+images_path="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Reference/run1/undist"   # Directory containing images
+overall_output_path="logs/gopro/run_all_5_50_lk_chunks_170000"
 model_path="/home/steffen/ModelWeights/pi3/model.safetensors"
 calib_file=""                                # Optional path to camera calibration JSON
+
+# rm -rf "$overall_output_path"
 
 # Processing defaults
 overlap=5
@@ -18,14 +20,14 @@ use_inverse_depth=true
 max_observations_per_track=5
 keypoints="grid"
 use_lk_refinement=false
-frame_stride=2
+frame_stride=3
 
 
 # New features (booleans)
 enable_fp8=false
 enable_attention_merge=false
 merging_ratio="0.8"
-compile_models=false
+compile_models=true
 shared_intrinsics=true
 pixel_limit=170000
 
